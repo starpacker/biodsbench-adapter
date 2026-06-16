@@ -1,0 +1,36 @@
+# BioDSBench shared task-execution environment
+# ---------------------------------------------
+#
+# This env satisfies the union of ``envs/runtime/requirements.txt``
+# across all 118 BioDSBench tasks.  Use with::
+#
+#     conda env create -f environment.yml -n biodsbench
+#     python scripts/setup_task_venvs.py \
+#         --shared-conda biodsbench \
+#         --tasks-dir biodsbench-data/tasks
+#
+# To verify all tasks are runnable::
+#
+#     python scripts/setup_task_venvs.py --check \
+#         --tasks-dir biodsbench-data/tasks
+#
+name: biodsbench
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pandas>=1.5
+  - numpy>=1.23
+  - scipy>=1.9
+  - matplotlib>=3.6
+  - seaborn>=0.12
+  - scikit-learn>=1.2
+  - statsmodels>=0.14
+  - pip:
+      - lifelines>=0.27
+      - PyComplexHeatmap>=1.8
+      - umap-learn
+      - anndata
+      - scanpy
