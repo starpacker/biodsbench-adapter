@@ -1,0 +1,5 @@
+# Python deps for biodsbench-adapter bootstrap / scripts
+# (the actual task-execution venv is described in environment.yml)
+huggingface_hub>=0.20.0
+anthropic>=0.30.0
+PyYAML>=6.0
