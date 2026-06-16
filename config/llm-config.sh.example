@@ -1,0 +1,10 @@
+#!/bin/bash
+# LLM API Configuration (example)
+# Copy this file to llm-config.sh and fill in your real credentials.
+# llm-config.sh is git-ignored.
+
+export API_KEY="${API_KEY:-your-api-key-here}"
+export BASE_URL="${BASE_URL:-https://api.anthropic.com}"
+export MODEL_NAME="${MODEL_NAME:-claude-opus-4-1-20250805}"
+export GATEWAY_PROTOCOL="${GATEWAY_PROTOCOL:-anthropic}"
+export AGENT_LOG_DIR="${AGENT_LOG_DIR:-./output}"

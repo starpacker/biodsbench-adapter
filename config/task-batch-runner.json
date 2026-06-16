@@ -1,0 +1,32 @@
+{
+  "tasks": [
+    "eht_black_hole_dynamic",
+    "eht_black_hole_feature_extraction_dynamic",
+    "eht_black_hole_UQ",
+    "fpm_inr_reconstruction",
+    "fourier_ptychography",
+    "exoplanet_imaging",
+    "microscope_denoising",
+    "pnp_mri_reconstruction",
+    "single_molecule_light_field",
+    "usct_FWI",
+    "SSNP_ODT",
+    "seismic_FWI_original",
+    "confocal-nlos-fk",
+    "reflection_ODT",
+    "plane_wave_ultrasound",
+    "xray_ptychography_tike"
+  ],
+  "batchSize": 3,
+  "tasksDir": "tasks",
+  "runsDir": "output/runs",
+  "maxRounds": 5,
+  "timeoutSeconds": 7200,
+  "workerTimeoutGraceSeconds": 60,
+  "temperature": 1,
+  "thinking": "disabled",
+  "timestampPrefix": "fail_rerun",
+  "continueOnFailure": true,
+  "loadLocalConfig": true,
+  "bunPath": "/home/admin/.bun/bin/bun"
+}

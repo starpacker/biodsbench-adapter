@@ -1,0 +1,17 @@
+{
+  "tasks": [
+    "25303977_0"
+  ],
+  "batchSize": 3,
+  "tasksDir": "tasks",
+  "runsDir": "output/Bio_runs",
+  "maxRounds": 5,
+  "timeoutSeconds": 7200,
+  "workerTimeoutGraceSeconds": 60,
+  "temperature": 1,
+  "thinking": "disabled",
+  "timestampPrefix": "test",
+  "continueOnFailure": true,
+  "loadLocalConfig": true,
+  "bunPath": "/home/admin/.bun/bin/bun"
+}
