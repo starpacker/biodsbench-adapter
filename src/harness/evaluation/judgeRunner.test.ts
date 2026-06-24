@@ -3,7 +3,8 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { mkdir } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { resolveTaskPython } from './judgeRunner.js'
+import { buildJudgeArgs, resolveTaskPython } from './judgeRunner.js'
+import type { TaskRun } from './types.js'
 
 describe('resolveTaskPython', () => {
   test('uses env_manifest platform-specific python path', async () => {
@@ -58,5 +59,51 @@ describe('resolveTaskPython', () => {
     } finally {
       rmSync(temp, { recursive: true, force: true })
     }
+  })
+})
+
+describe('buildJudgeArgs', () => {
+  function taskRun(root: string): TaskRun {
+    return {
+      taskId: 'demo_task',
+      runId: 'demo_task_run',
+      runDir: join(root, 'run'),
+      judgeDir: join(root, 'run', '.judge_private'),
+      publicDir: join(root, 'run', 'public'),
+      workspaceDir: join(root, 'run', 'workspace'),
+      outputsDir: join(root, 'run', 'outputs'),
+      logsDir: join(root, 'run', 'logs'),
+      taskDir: join(root, 'tasks', 'demo_task'),
+      manifest: {
+        version: 1,
+        task_id: 'demo_task',
+        entrypoints: {
+          judge: 'evaluation/judge.py',
+          cases: 'visible_data/cases.json',
+          output_schema: 'output_schema.json',
+          metrics: 'evaluation/metrics.json',
+        },
+      },
+    }
+  }
+
+  test('defaults judge feedback level to metric_status', () => {
+    const args = buildJudgeArgs({
+      taskRun: taskRun('/tmp/eval'),
+      round: 2,
+    })
+
+    expect(args).toContain('--feedback-level')
+    expect(args[args.indexOf('--feedback-level') + 1]).toBe('metric_status')
+  })
+
+  test('allows metric_full judge feedback for diagnostic runs', () => {
+    const args = buildJudgeArgs({
+      taskRun: taskRun('/tmp/eval'),
+      round: 2,
+      feedbackLevel: 'metric_full',
+    })
+
+    expect(args[args.indexOf('--feedback-level') + 1]).toBe('metric_full')
   })
 })

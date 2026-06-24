@@ -2,7 +2,6 @@ import { existsSync } from 'fs'
 import { readFile } from 'fs/promises'
 import { isAbsolute, join, relative, resolve } from 'path'
 import type { RuntimeResolution } from './types.js'
-import { resolveSharedPython, SHARED_VENV_DIR } from './biomnibenchAdapter.js'
 
 type EnvManifest = {
   default_env?: string
@@ -106,27 +105,9 @@ export async function resolveTaskRuntime(publicDir: string): Promise<RuntimeReso
     }
   }
 
-  // BioMniBench fallback: when the task has no env_manifest.json AND no
-  // per-task venv, fall back to the shared venv at <repoRoot>/shared_venv.
-  // This lets BioMniBench `da-*` tasks reuse a single Python environment
-  // populated with scanpy/anndata/pandas/etc.
-  const sharedPython = resolveSharedPython()
-  if (sharedPython) {
-    checked.push(sharedPython)
-    return {
-      ok: true,
-      python: sharedPython,
-      displayPath: relative(publicDir, SHARED_VENV_DIR).startsWith('..')
-        ? sharedPython
-        : `public/${relative(publicDir, sharedPython).replace(/\\/g, '/')}`,
-      envName: 'shared',
-      checked,
-    }
-  }
-
   return {
     ok: false,
-    error: `Unable to resolve task Python from ${manifestPath}; checked configured and fallback runtime paths, and no shared venv at ${SHARED_VENV_DIR}.`,
+    error: `Unable to resolve task Python from ${manifestPath}; checked configured and fallback runtime paths.`,
     checked,
   }
 }

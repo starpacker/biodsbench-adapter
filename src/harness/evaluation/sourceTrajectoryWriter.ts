@@ -19,9 +19,23 @@ export type CleanTrajectoryRecord =
       run_metadata?: EvaluationRunMetadata
     }
   | {
+      kind: 'initial_prompt_audit'
+      expected_known_task_materials_block: boolean
+      has_known_task_materials_block: boolean
+      known_task_materials_block_allowed: boolean
+      known_task_materials_prompt_mode?: 'minimal' | 'deep_read' | 'none'
+      known_task_materials_deep_read_requested?: boolean
+    }
+  | {
       kind: 'assistant_text'
       round: number
       text: string
+    }
+  | {
+      kind: 'assistant_thinking'
+      round: number
+      text: string
+      signature?: string
     }
   | {
       kind: 'tool_call'
@@ -85,6 +99,14 @@ export type CleanTrajectoryRecord =
       is_error?: boolean
       usage?: unknown
       errors?: string[]
+    }
+  | {
+      kind: 'context_event'
+      round: number
+      subtype: string
+      message?: string
+      usage?: unknown
+      metadata?: unknown
     }
   | {
       kind: 'finalize'
@@ -207,6 +229,18 @@ export class SourceTrajectoryWriter {
       }
       return
     }
+    if (event.type === 'assistant_thinking') {
+      const text = event.text ?? ''
+      if (text.trim().length > 0) {
+        await this.appendClean({
+          kind: 'assistant_thinking',
+          round,
+          text: truncateText(text) ?? '',
+          ...(event.signature !== undefined ? { signature: event.signature } : {}),
+        })
+      }
+      return
+    }
     if (event.type === 'tool_call') {
       await this.appendClean({
         kind: 'tool_call',
@@ -287,6 +321,17 @@ export class SourceTrajectoryWriter {
         is_error: event.isError,
         usage: event.usage,
         errors: event.errors,
+      })
+      return
+    }
+    if (event.type === 'context_event') {
+      await this.appendClean({
+        kind: 'context_event',
+        round,
+        subtype: event.subtype,
+        message: truncateText(event.message),
+        usage: cleanInput(event.usage),
+        metadata: cleanInput(event.metadata),
       })
       return
     }

@@ -1,12 +1,12 @@
 import { readdir, readFile } from 'fs/promises'
 import { join, relative } from 'path'
+import type { ResumeRunSnapshot } from './runResume.js'
 import type {
+  EvaluationNetworkPolicy,
   JudgeResult,
-  PriorSubtaskContext,
   RuntimeInfo,
   TaskRun,
 } from './types.js'
-import { isBioMniBenchTask } from './biomnibenchAdapter.js'
 
 type OutputSchema = {
   submission?: {
@@ -41,6 +41,101 @@ type CompactJudgeFeedback = {
   message?: string
 }
 
+type SourcePromptPolicyOptions = {
+  networkPolicy?: EvaluationNetworkPolicy
+  agentToolAvailable?: boolean
+}
+
+export const KNOWN_TASK_MATERIALS_PROMPT_BLOCK = [
+  '<known_task_materials>',
+  'Additional readable materials are available under public/known_tasks/.',
+  '</known_task_materials>',
+].join('\n')
+
+export const KNOWN_TASK_MATERIALS_DEEP_READ_PROMPT_BLOCK = [
+  '<known_task_materials>',
+  'Additional readable materials are available under public/known_tasks/.',
+  'Before implementation or long experiments, inspect every known task\'s README.md and its std_code entry points, including main.py and src modules for data loading, physics/forward models, solvers, preprocessing, and output writing.',
+  'When more than one known task is exposed, do not assume any single one matches the current task end to end. Decompose the current task into dimensions such as data and hardware geometry, forward physics, inversion algorithm, regularization, and output construction. For each dimension, decide whether a known material is directly reusable, needs adaptation (different time or frequency representation, different solver family, different boundary handling, different units or scaling), or has no reusable counterpart and must be designed from public/ alone.',
+  'Call out paradigm mismatches between the known materials and the current task and sketch a concrete adaptation before writing solver code.',
+  'Write concise per-dimension notes to workspace/known_task_materials_notes.md.',
+  'At the top of workspace/plans/round_NN.md, include a "Known-task synthesis" section that records the per-dimension reuse/adapt/novel decisions, the adaptations required, and the parts that must be designed from public/ alone.',
+  'Decide yourself whether any material is relevant; do not blindly copy constants, file paths, fixed iteration counts, or task-specific recipes from known std_code.',
+  '</known_task_materials>',
+].join('\n')
+
+export function knownTaskMaterialsPromptBlock(
+  deepRead = false,
+  _options?: SourcePromptPolicyOptions,
+): string {
+  return deepRead
+    ? KNOWN_TASK_MATERIALS_DEEP_READ_PROMPT_BLOCK
+    : KNOWN_TASK_MATERIALS_PROMPT_BLOCK
+}
+
+export function activeSkillsPromptBlock(skillNames: string[] = []): string {
+  const visibleNames = [...new Set(skillNames.filter(Boolean))].sort((a, b) =>
+    a.localeCompare(b),
+  )
+  return [
+    '<active_skills>',
+    'The native Skill tool is enabled for this run.',
+    'At the start of each judge round, before writing the round plan or solver code, call the Skill tool to inspect relevant active skills and incorporate any applicable reusable guidance.',
+    'Use retrieved skill guidance as abstract process advice only; do not infer or request hidden task materials from it.',
+    'In the round plan, include a section named "Applied skills checklist" before implementation.',
+    'That checklist must name each applicable skill, list the abstract items you will apply, state the anti-patterns you are avoiding, and define the cheap probe, stop condition, expected runtime, and log path before any long run.',
+    'Before finalize_submission, write workspace/skill_application.json with schema_version: 1 and a skills array.',
+    'Each exposed skill entry must include skill, status, evidence_path, and reason; status must be used, not_applicable, or blocked_but_overridden.',
+    'Use evidence_path for a run-local public/workspace/logs artifact that proves the contract item was checked; do not put private paths, reference-solution paths, hidden data, or task-specific leaked constants in this file.',
+    ...(visibleNames.length > 0
+      ? ['Allowed active skill names:', ...visibleNames.map(name => `- ${name}`)]
+      : ['Available active skills are discoverable through the Skill tool.']),
+    '</active_skills>',
+  ].join('\n')
+}
+
+export function userPromptBlock(userPrompt: string | undefined): string | undefined {
+  const trimmed = userPrompt?.trim()
+  if (!trimmed) return undefined
+  return ['<user_prompt>', trimmed, '</user_prompt>'].join('\n')
+}
+
+export function runMemoryPromptBlock(memory: { path: string; content: string }): string {
+  return [
+    '<run_memory>',
+    `path: ${memory.path}`,
+    memory.content,
+    '</run_memory>',
+  ].join('\n')
+}
+
+export function resumeContextPromptBlock(snapshot: Partial<ResumeRunSnapshot>): string {
+  const contextEvents = snapshot.contextEvents ?? []
+  return [
+    '<resume_context>',
+    `run_dir: ${snapshot.runDir ?? '(unknown)'}`,
+    `task_id: ${snapshot.taskId ?? '(unknown)'}`,
+    snapshot.latestPlan ? '<latest_plan>' : undefined,
+    snapshot.latestPlan?.trim(),
+    snapshot.latestPlan ? '</latest_plan>' : undefined,
+    snapshot.runMemory ? '<previous_run_memory>' : undefined,
+    snapshot.runMemory?.trim(),
+    snapshot.runMemory ? '</previous_run_memory>' : undefined,
+    ...(contextEvents.length > 0
+      ? [
+          '<context_events>',
+          ...contextEvents.map(event =>
+            `- round=${event.round ?? 'unknown'} subtype=${event.subtype}${event.message ? ` message=${event.message}` : ''}`,
+          ),
+          '</context_events>',
+        ]
+      : []),
+    '</resume_context>',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
 function stripUtf8Bom(value: string): string {
   return value.charCodeAt(0) === 0xfeff ? value.slice(1) : value
 }
@@ -59,7 +154,11 @@ function roundPlanPath(round: number): string {
 
 function shouldSkipPublicPath(relativePath: string): boolean {
   const parts = relativePath.replace(/\\/g, '/').split('/')
-  return parts.includes('.venv') || parts.includes('.venv-posix')
+  return (
+    parts[0] === 'known_tasks' ||
+    parts.includes('.venv') ||
+    parts.includes('.venv-posix')
+  )
 }
 
 async function collectPublicFiles(
@@ -135,92 +234,10 @@ function buildVisibleCases(cases: CasesConfig | undefined): string {
     .join('\n')
 }
 
-/** Maximum characters of generated code we inline per prior sub-task. */
-const PRIOR_CODE_CHAR_LIMIT = 6000
-
-/** Maximum characters of description we inline per prior sub-task. */
-const PRIOR_DESCRIPTION_CHAR_LIMIT = 1200
-
-function truncateForPrompt(value: string, limit: number, label: string): string {
-  if (!value) return ''
-  if (value.length <= limit) return value
-  const head = value.slice(0, limit)
-  return `${head}\n... [${label} truncated: ${value.length - limit} more chars elided]`
-}
-
-/**
- * Render the prior sub-task block that gets prepended to each new sub-task's
- * initial prompt in true-serial mode. Returns an empty string when no prior
- * sub-tasks are supplied so the prompt stays identical to single-task mode.
- */
-function formatPriorSubtasks(priorSubtasks: PriorSubtaskContext[] | undefined): string {
-  if (!priorSubtasks || priorSubtasks.length === 0) return ''
-  const blocks: string[] = [
-    '<prior_subtasks>',
-    'You are continuing a serial multi-sub-task study. Earlier sub-tasks from the',
-    'same parent paper have already been solved by you in a separate evaluation',
-    'session. Their final solver code and outcomes are provided below so you can:',
-    '  - reuse data-loading patterns, column names, and preprocessing logic you',
-    '    already established, instead of re-deriving them;',
-    '  - avoid repeating mistakes that previously failed judge;',
-    '  - keep results consistent across sub-tasks (e.g. same filtering thresholds,',
-    '    same train/test splits, same statistical conventions).',
-    'Each sub-task is independently judged - do NOT assume their outputs/ files',
-    'are available to your current run. Always re-read the data files yourself.',
-    '',
-  ]
-  for (const prior of priorSubtasks) {
-    blocks.push('<prior_subtask>')
-    blocks.push(`task_id: ${prior.taskId}`)
-    if (typeof prior.taskIdx === 'number') {
-      blocks.push(`task_idx: ${prior.taskIdx}`)
-    }
-    if (prior.status) {
-      blocks.push(`status: ${prior.status}`)
-    }
-    if (typeof prior.passed === 'boolean') {
-      blocks.push(`judge_passed: ${prior.passed}`)
-    }
-    if (prior.description) {
-      blocks.push('<description>')
-      blocks.push(
-        truncateForPrompt(
-          prior.description.trim(),
-          PRIOR_DESCRIPTION_CHAR_LIMIT,
-          'description',
-        ),
-      )
-      blocks.push('</description>')
-    }
-    if (prior.generatedCode) {
-      blocks.push(`<generated_code language="python">`)
-      blocks.push(
-        truncateForPrompt(
-          prior.generatedCode,
-          PRIOR_CODE_CHAR_LIMIT,
-          'generated_code',
-        ),
-      )
-      blocks.push('</generated_code>')
-    }
-    if (prior.judgeFeedback) {
-      blocks.push('<judge_feedback>')
-      blocks.push(prior.judgeFeedback.trim())
-      blocks.push('</judge_feedback>')
-    }
-    if (prior.notes) {
-      blocks.push('<notes>')
-      blocks.push(prior.notes.trim())
-      blocks.push('</notes>')
-    }
-    blocks.push('</prior_subtask>')
-    blocks.push('')
-  }
-  blocks.push('</prior_subtasks>')
-  return blocks.join('\n')
-}
-
-export function buildSourceSystemPrompt(extra?: string): string {
+export function buildSourceSystemPrompt(
+  extra?: string,
+  _options?: SourcePromptPolicyOptions,
+): string {
   return [
     'You are an autonomous solver inside a source-native evaluation harness.',
     '',
@@ -242,7 +259,8 @@ export function buildSourceSystemPrompt(extra?: string): string {
     '- Write the round plan to workspace/plans/round_NN.md and copy the current round plan to workspace/plan.md.',
     '- The plan should be as detailed as needed: include task understanding, public data observations, assumptions, algorithm strategy, validation strategy, risks, and concrete execution steps.',
     '- Avoid generic filler. Every plan section should contain information specific to this task or this judge feedback.',
-    '- Do not use TodoWrite; plans must be file artifacts.',
+    '- workspace/plans/round_NN.md and workspace/plan.md are the authoritative plan artifacts; do not replace them with TodoWrite items.',
+    '- You may use TodoWrite as an in-turn working-memory checklist (e.g. tracking which experiments have been run, which files still need to be regenerated). Treat TodoWrite as scratchpad, not as the round plan.',
     '',
     'Round closure discipline:',
     '- Judge feedback is more valuable than private speculation. Prefer submitting a valid best attempt over running open-ended experiments.',
@@ -252,6 +270,8 @@ export function buildSourceSystemPrompt(extra?: string): string {
     'Experiment discipline:',
     '- Put non-trivial Python experiments in workspace/experiments/*.py or workspace/*.py.',
     '- Do not put long Python programs in Bash python -c; Bash should run scripts or short validation commands.',
+    '- For long Python runs, prefer python -u with an explicit timeout and log path so progress is observable.',
+    '- Before starting a long run, check whether the same experiment is already running; do not launch duplicate long-running processes.',
     '',
     'When final output files exist under outputs/, call finalize_submission. A text answer is not a submission.',
     extra?.trim(),
@@ -265,63 +285,17 @@ export async function buildInitialSourcePrompt(input: {
   runtime: RuntimeInfo
   userTask: string
   maxRounds: number
-  priorSubtasks?: PriorSubtaskContext[]
+  hasKnownTaskMaterials?: boolean
+  knownTaskMaterialsDeepRead?: boolean
+  hasActiveSkills?: boolean
+  activeSkillNames?: string[]
+  networkPolicy?: EvaluationNetworkPolicy
+  agentToolAvailable?: boolean
+  userPrompt?: string
+  runMemory?: { path: string; content: string }
+  resumeContext?: Partial<ResumeRunSnapshot>
 }): Promise<string> {
-  const { taskRun, runtime, userTask, maxRounds, priorSubtasks } = input
-  const priorBlock = formatPriorSubtasks(priorSubtasks)
-
-  // BioMniBench tasks have free-form output (trace.md + answer.txt) instead
-  // of array-based submissions; use a tailored prompt that omits schema/cases.
-  if (isBioMniBenchTask(taskRun.taskDir)) {
-    const publicFiles = await collectPublicFiles(taskRun.publicDir)
-    return [
-      '<run_context>',
-      `task_id: ${taskRun.taskId}`,
-      'cwd: run root',
-      `python: ${runtime.displayPath}`,
-      `max_judge_rounds: ${maxRounds}`,
-      'submission_dir: outputs/',
-      'current_plan_file: workspace/plan.md',
-      `round_plan_file: ${roundPlanPath(1)}`,
-      '</run_context>',
-      '',
-      '<public_files>',
-      formatPublicFiles(publicFiles),
-      '</public_files>',
-      ...(priorBlock ? ['', priorBlock] : []),
-      '',
-      '<task_statement>',
-      userTask.trim() || '(No README.md content was found; inspect public/.)',
-      '</task_statement>',
-      '',
-      '<output_contract>',
-      'This is a BioMniBench data analysis task. The judge is an LLM that scores',
-      'your work against a rubric. You MUST produce exactly two files:',
-      '  - outputs/trace.md      Detailed analysis trace: code you ran, intermediate',
-      '                          results, plots described in text, reasoning.',
-      '  - outputs/answer.txt    Concise final answer to the task question.',
-      'Both files are evaluated by an LLM judge against a hidden rubric. Be specific,',
-      'show numerical results, and reference the data you actually computed.',
-      '</output_contract>',
-      '',
-      '<visible_cases>',
-      'No discrete cases. Data files are in public/data/ and public/visible_data/.',
-      'Read public/README.md for the full task description and data dictionary.',
-      '</visible_cases>',
-      '',
-      '<workflow>',
-      '1. Read public/README.md carefully for the task question, data files, and any constraints.',
-      '2. Inspect public/data/ and public/visible_data/ to understand the actual file formats.',
-      '3. Write a detailed task-specific plan to ' + roundPlanPath(1) + ' and refresh workspace/plan.md.',
-      '4. Write Python solver code under workspace/ or workspace/experiments/.',
-      '5. IMPORTANT: cwd is run root. Use public/data/ etc., NOT ../public/data/.',
-      '6. The shared Python env already has pandas, numpy, scipy, scanpy, anndata, sklearn, statsmodels, matplotlib, seaborn, openpyxl. Do NOT install packages.',
-      '7. After computing your answer, write outputs/trace.md (analysis trace) and outputs/answer.txt (final answer).',
-      '8. Call finalize_submission. The judge will score against a rubric.',
-      '</workflow>',
-    ].join('\n')
-  }
-
+  const { taskRun, runtime, userTask, maxRounds } = input
   const [publicFiles, schema, cases] = await Promise.all([
     collectPublicFiles(taskRun.publicDir),
     readJsonIfExists<OutputSchema>(join(taskRun.publicDir, 'output_schema.json')),
@@ -342,7 +316,6 @@ export async function buildInitialSourcePrompt(input: {
     '<public_files>',
     formatPublicFiles(publicFiles),
     '</public_files>',
-    ...(priorBlock ? ['', priorBlock] : []),
     '',
     '<task_statement>',
     userTask.trim() || '(No README.md content was found; inspect public/.)',
@@ -356,15 +329,27 @@ export async function buildInitialSourcePrompt(input: {
     buildVisibleCases(cases),
     '</visible_cases>',
     '',
+    ...(userPromptBlock(input.userPrompt)
+      ? [userPromptBlock(input.userPrompt)!, '']
+      : []),
+    ...(input.hasKnownTaskMaterials
+      ? [knownTaskMaterialsPromptBlock(input.knownTaskMaterialsDeepRead), '']
+      : []),
+    ...(input.hasActiveSkills
+      ? [activeSkillsPromptBlock(input.activeSkillNames), '']
+      : []),
+    ...(input.runMemory ? [runMemoryPromptBlock(input.runMemory), ''] : []),
+    ...(input.resumeContext ? [resumeContextPromptBlock(input.resumeContext), ''] : []),
     '<workflow>',
     '1. Use <output_contract> and <visible_cases> as the submission contract. Inspect relevant public case input files for raw keys, shapes, dtypes, finite status, and value ranges before choosing a solver; do not assume array structure.',
-    `2. Once you understand the task, write ${roundPlanPath(1)} and refresh workspace/plan.md.`,
-    '3. Write solver code under workspace/ and longer experiments under workspace/experiments/.',
-    '4. IMPORTANT: Your cwd is run root. Always use paths relative to run root. Data files are at public/workdir/, NOT ../public/workdir/. When writing code in workspace/, use public/workdir/ for data paths.',
-    '5. Use Bash for short commands or to run scripts; do not use long inline python -c programs.',
-    '6. Run a bounded set of focused experiments, then choose the best current solver.',
-    '7. Write final submission files under outputs/ and run a quick local format check against <output_contract>.',
-    '8. Call finalize_submission. The judge feedback is more valuable than private speculation.',
+    '2. Treat public README/case params/metadata as authoritative for solver budgets and task constants; do not reuse older defaults from memory, skills, or prior runs when they conflict with current public files.',
+    `3. Once you understand the task, write ${roundPlanPath(1)} and refresh workspace/plan.md.`,
+    '4. Before long optimization or simulation, record the public parameter source, planned count, observed per-iteration time, total runtime estimate, stop condition, and log path in the round plan.',
+    '5. Write solver code under workspace/ and longer experiments under workspace/experiments/.',
+    '6. Use Bash for short commands or to run scripts; do not use long inline python -c programs.',
+    '7. Run a bounded set of focused experiments, then choose the best current solver.',
+    '8. Write final submission files under outputs/ and run a quick local format check against <output_contract>.',
+    '9. Call finalize_submission. The judge feedback is more valuable than private speculation.',
     '</workflow>',
   ].join('\n')
 }
@@ -424,6 +409,10 @@ export function buildJudgeFeedbackPrompt(input: {
   round: number
   maxRounds: number
   judgeResult: JudgeResult
+  hasActiveSkills?: boolean
+  activeSkillNames?: string[]
+  userPrompt?: string
+  runMemory?: { path: string; content: string }
 }): string {
   const { round, maxRounds, judgeResult } = input
   const nextRound = round + 1
@@ -440,11 +429,71 @@ export function buildJudgeFeedbackPrompt(input: {
     ...(compact.message ? [`message: ${compact.message}`] : []),
     '</judge_feedback>',
     '',
+    ...(userPromptBlock(input.userPrompt)
+      ? [userPromptBlock(input.userPrompt)!, '']
+      : []),
+    ...(input.hasActiveSkills
+      ? [activeSkillsPromptBlock(input.activeSkillNames), '']
+      : []),
+    ...(input.runMemory ? [runMemoryPromptBlock(input.runMemory), ''] : []),
     '<workflow>',
     `Before modifying code for this feedback, understand the feedback, then write ${roundPlanPath(nextRound)} and refresh workspace/plan.md.`,
+    ...(input.hasActiveSkills
+      ? ['Start the next plan by re-reading Skill and explaining which skill contract item failed, was ignored, or was disproved by the judge feedback.']
+      : []),
     'Make one focused fix or a small bounded experiment set, validate again, regenerate outputs, then submit the best current output to the judge with finalize_submission.',
     'Before finalize_submission, revalidate outputs against the same contract.',
     'Use workspace/experiments/*.py for longer probes; do not put long Python programs in Bash python -c.',
+    '</workflow>',
+  ].join('\n')
+}
+
+export function buildPromptTooLongRecoveryPrompt(input: {
+  round: number
+  maxRounds: number
+  judgeResult?: JudgeResult
+  hasActiveSkills?: boolean
+  activeSkillNames?: string[]
+  userPrompt?: string
+  runMemory?: { path: string; content: string }
+}): string {
+  const compact = input.judgeResult
+    ? compactJudgeFeedback(input.judgeResult)
+    : undefined
+  return [
+    '<prompt_too_long_recovery>',
+    `round: ${input.round}/${input.maxRounds}`,
+    'The previous source-agent session exceeded the model prompt/context limit.',
+    'Continue in this fresh session from run-local artifacts instead of replaying the bloated conversation.',
+    'Do not restart broad exploration. Read workspace/plan.md, workspace/plans/, workspace/agent_memory.md, logs/agent/, and public/ only as needed to recover the current state.',
+    'If outputs/ already contains valid candidate files, prefer validating and calling finalize_submission over new open-ended work.',
+    ...(compact
+      ? [
+          '<latest_judge_feedback>',
+          `status: ${input.judgeResult?.status}`,
+          `reward: ${input.judgeResult?.reward}`,
+          `format: ${compact.format}`,
+          `reason: ${compact.reasons.join('|') || 'none'}`,
+          ...formatList('failed_metrics', compact.failedMetrics),
+          ...formatList('passed_metrics', compact.passedMetrics),
+          ...(compact.message ? [`message: ${compact.message}`] : []),
+          '</latest_judge_feedback>',
+        ]
+      : []),
+    '</prompt_too_long_recovery>',
+    '',
+    ...(userPromptBlock(input.userPrompt)
+      ? [userPromptBlock(input.userPrompt)!, '']
+      : []),
+    ...(input.hasActiveSkills
+      ? [activeSkillsPromptBlock(input.activeSkillNames), '']
+      : []),
+    ...(input.runMemory ? [runMemoryPromptBlock(input.runMemory), ''] : []),
+    '<workflow>',
+    '1. Reconstruct only the minimum current state needed for this round.',
+    '2. Prefer implementation/contract error checks over optimizer-detail tuning.',
+    '3. Make one focused fix or submit the best currently valid outputs.',
+    '4. Revalidate outputs against the public output contract, then call finalize_submission.',
     '</workflow>',
   ].join('\n')
 }

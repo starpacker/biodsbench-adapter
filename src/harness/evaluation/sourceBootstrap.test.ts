@@ -46,4 +46,35 @@ describe('ensureSourceRuntimeGlobals', () => {
       delete process.env.MODEL_NAME
     }
   })
+
+  test('local gateway env names override stale Claude source env names', () => {
+    const oldApiKey = process.env.ANTHROPIC_API_KEY
+    const oldBaseUrl = process.env.ANTHROPIC_BASE_URL
+    const oldSonnet = process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
+    const oldOpus = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+    try {
+      process.env.ANTHROPIC_API_KEY = 'stale-key'
+      process.env.ANTHROPIC_BASE_URL = 'https://stale.invalid'
+      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'stale-sonnet'
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'stale-opus'
+      process.env.API_KEY = 'local-key'
+      process.env.BASE_URL = 'https://local.invalid'
+      process.env.MODEL_NAME = 'local-model'
+
+      ensureSourceRuntimeGlobals()
+
+      expect(process.env.ANTHROPIC_API_KEY).toBe('local-key')
+      expect(process.env.ANTHROPIC_BASE_URL).toBe('https://local.invalid')
+      expect(process.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('local-model')
+      expect(process.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('local-model')
+    } finally {
+      restoreEnv('ANTHROPIC_API_KEY', oldApiKey)
+      restoreEnv('ANTHROPIC_BASE_URL', oldBaseUrl)
+      restoreEnv('ANTHROPIC_DEFAULT_SONNET_MODEL', oldSonnet)
+      restoreEnv('ANTHROPIC_DEFAULT_OPUS_MODEL', oldOpus)
+      delete process.env.API_KEY
+      delete process.env.BASE_URL
+      delete process.env.MODEL_NAME
+    }
+  })
 })

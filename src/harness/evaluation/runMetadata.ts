@@ -94,7 +94,6 @@ export async function collectRunMetadata(
     model:
       firstNonEmpty(
         env.MODEL_NAME,
-        env.ANTHROPIC_MODEL,
         env.ANTHROPIC_DEFAULT_SONNET_MODEL,
         env.ANTHROPIC_DEFAULT_OPUS_MODEL,
       ) ?? 'unknown',

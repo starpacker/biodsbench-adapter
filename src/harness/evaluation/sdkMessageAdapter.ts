@@ -49,6 +49,22 @@ export function sourceEventsFromSdkMessage(message: unknown): SourceAgentEvent[]
   if (type === 'assistant') {
     for (const rawBlock of content) {
       const block = asRecord(rawBlock)
+      if (block.type === 'thinking') {
+        const thinkingText =
+          typeof block.thinking === 'string'
+            ? block.thinking
+            : textFromBlock(block)
+        if (thinkingText?.trim()) {
+          const signature =
+            typeof block.signature === 'string' ? block.signature : undefined
+          events.push({
+            type: 'assistant_thinking',
+            text: thinkingText,
+            ...(signature !== undefined ? { signature } : {}),
+            raw: message,
+          })
+        }
+      }
       if (block.type === 'text') {
         const text = textFromBlock(block)
         if (text?.trim()) events.push({ type: 'assistant_text', text, raw: message })
@@ -87,6 +103,17 @@ export function sourceEventsFromSdkMessage(message: unknown): SourceAgentEvent[]
     }
   }
 
+  if (type === 'system') {
+    events.push({
+      type: 'context_event',
+      subtype: stringFromRecord(record, 'subtype') ?? 'system',
+      message: stringFromRecord(record, 'message'),
+      usage: record.usage,
+      metadata: record,
+      raw: message,
+    })
+  }
+
   if (type === 'result') {
     events.push({
       type: 'agent_result',
@@ -99,6 +126,14 @@ export function sourceEventsFromSdkMessage(message: unknown): SourceAgentEvent[]
       errors: errorsFromRecord(record),
       raw: message,
     })
+    if (record.stop_reason === 'model_context_window_exceeded') {
+      events.push({
+        type: 'context_event',
+        subtype: 'model_context_window_exceeded',
+        usage: record.usage,
+        raw: message,
+      })
+    }
   }
 
   return events

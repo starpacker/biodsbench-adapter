@@ -1,14 +1,20 @@
 import { existsSync } from 'fs'
 import { cp, mkdir, readFile, symlink, writeFile } from 'fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path'
-import type { TaskManifest, TaskRun } from './types.js'
-import { isBioMniBenchTask, loadBioMniBenchManifest } from './biomnibenchAdapter.js'
+import { copyKnownTaskMaterials } from './knownTaskMaterials.js'
+import type {
+  KnownTaskMaterialsAudit,
+  KnownTaskMaterialsOptions,
+  TaskManifest,
+  TaskRun,
+} from './types.js'
 
 export type CreateTaskRunInput = {
   taskId: string
   tasksDir?: string
   runsDir?: string
   timestamp?: string
+  knownTaskMaterials?: KnownTaskMaterialsOptions
 }
 
 function makeTimestamp(date = new Date()): string {
@@ -62,14 +68,6 @@ function isPrivatePath(path: string): boolean {
 async function readTaskManifest(taskDir: string): Promise<TaskManifest> {
   const raw = await readFile(join(taskDir, 'task_manifest.json'), 'utf8')
   return JSON.parse(stripUtf8Bom(raw)) as TaskManifest
-}
-
-async function loadTaskManifestForTask(taskDir: string, taskId: string): Promise<TaskManifest> {
-  // BioMniBench tasks have a minimal on-disk manifest; synthesise/merge fields.
-  if (isBioMniBenchTask(taskDir)) {
-    return loadBioMniBenchManifest(taskDir, taskId)
-  }
-  return readTaskManifest(taskDir)
 }
 
 function stripUtf8Bom(value: string): string {
@@ -139,7 +137,7 @@ export async function createTaskRun(input: CreateTaskRunInput): Promise<TaskRun>
   const tasksDir = resolve(input.tasksDir ?? 'tasks')
   const runsDir = resolve(input.runsDir ?? 'runs')
   const taskDir = resolveInside(tasksDir, input.taskId)
-  const manifest = await loadTaskManifestForTask(taskDir, input.taskId)
+  const manifest = await readTaskManifest(taskDir)
   if (manifest.task_id !== input.taskId) {
     throw new Error(
       `Task manifest id mismatch: expected ${input.taskId}, got ${manifest.task_id}`,
@@ -155,6 +153,10 @@ export async function createTaskRun(input: CreateTaskRunInput): Promise<TaskRun>
   const outputsDir = join(runDir, manifest.submission?.output_dir ?? 'outputs')
   const logsDir = join(runDir, 'logs')
 
+  if (existsSync(runDir) || existsSync(judgeDir)) {
+    throw new Error(`Run directory already exists: ${runDir}`)
+  }
+
   await mkdir(publicDir, { recursive: true })
   await mkdir(workspaceDir, { recursive: true })
   await mkdir(join(workspaceDir, 'plans'), { recursive: true })
@@ -168,6 +170,14 @@ export async function createTaskRun(input: CreateTaskRunInput): Promise<TaskRun>
     await copyPublicEntry(taskDir, publicDir, entry)
   }
   await linkHostRuntime(taskDir, publicDir)
+  const knownTaskMaterialsAudit: KnownTaskMaterialsAudit = input.knownTaskMaterials?.enabled
+    ? await copyKnownTaskMaterials({
+        targetTaskId: input.taskId,
+        tasksDir,
+        publicDir,
+        options: input.knownTaskMaterials,
+      })
+    : { enabled: false, copied: [], skipped: [] }
 
   const runManifest = {
     version: 1,
@@ -178,6 +188,7 @@ export async function createTaskRun(input: CreateTaskRunInput): Promise<TaskRun>
     workspace_dir: basename(workspaceDir),
     outputs_dir: relative(runDir, outputsDir),
     logs_dir: basename(logsDir),
+    known_task_materials: knownTaskMaterialsAudit,
     created_at: new Date().toISOString(),
   }
 

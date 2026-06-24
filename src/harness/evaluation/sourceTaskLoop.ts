@@ -1,13 +1,24 @@
-import { mkdir, readFile, writeFile } from 'fs/promises'
+import { existsSync } from 'fs'
+import { cp, mkdir, readFile, writeFile } from 'fs/promises'
 import { join, resolve } from 'path'
 import { createTaskRun } from './taskEnvironment.js'
 import { DefaultJudgeRunner } from './judgeRunner.js'
+import {
+  canUseEvaluationAgentTool,
+  normalizeEvaluationNetworkPolicy,
+  validateEvaluationNetworkPolicy,
+} from './networkPolicy.js'
 import { collectRunMetadata } from './runMetadata.js'
+import { writeRunMemory, type RunMemorySnapshot } from './runMemory.js'
+import { loadResumeRunSnapshot, type ResumeRunSnapshot } from './runResume.js'
 import { RunEventLogger, summarizeAgentEvent } from './runEventLogger.js'
 import {
+  KNOWN_TASK_MATERIALS_DEEP_READ_PROMPT_BLOCK,
+  KNOWN_TASK_MATERIALS_PROMPT_BLOCK,
   buildInitialSourcePrompt,
   buildJudgeFeedbackPrompt,
   buildNoFinalizeRecoveryPrompt,
+  buildPromptTooLongRecoveryPrompt,
   compactJudgeFeedback,
 } from './sourceContextBuilder.js'
 import { resolveTaskRuntime } from './sourceRuntimeResolver.js'
@@ -36,9 +47,23 @@ function remainingMilliseconds(deadline: number): number {
 
 const AGENT_GENERATOR_CLOSE_GRACE_MS = 5000
 const SESSION_DISPOSE_GRACE_MS = 5000
+const TERMINATION_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const
 
 function isTimeoutError(error: unknown): boolean {
   return errorMessage(error).includes('timed out')
+}
+
+function isPromptTooLongError(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase()
+  return (
+    message.includes('prompt is too long') ||
+    message.includes('prompt too long') ||
+    message.includes('context length') ||
+    message.includes('context window') ||
+    message.includes('request too large') ||
+    message.includes('maximum context') ||
+    message.includes('too many tokens')
+  )
 }
 
 async function withTimeout<T>(
@@ -88,6 +113,12 @@ async function disposeSessionWithTimeout(
   }
 }
 
+function exitCodeForSignal(signal: (typeof TERMINATION_SIGNALS)[number]): number {
+  if (signal === 'SIGINT') return 130
+  if (signal === 'SIGTERM') return 143
+  return 129
+}
+
 async function loadUserTask(publicDir: string): Promise<string> {
   try {
     return await readFile(join(publicDir, 'README.md'), 'utf8')
@@ -106,6 +137,7 @@ async function writeRunSummary(input: {
   runMetadata: EvaluationRunMetadata
   validationAttempts: SubmissionValidationResult[]
   warnings: SourceRunWarning[]
+  knownTaskMaterials?: RunSourceTaskLoopInput['knownTaskMaterials']
 }): Promise<void> {
   await mkdir(resolve(input.path, '..'), { recursive: true })
   await writeFile(
@@ -124,6 +156,13 @@ async function writeRunSummary(input: {
           issues: result.issues,
         })),
         warnings: input.warnings,
+        known_task_materials: {
+          enabled: Boolean(input.knownTaskMaterials?.enabled),
+          source_task_ids: input.knownTaskMaterials?.enabled
+            ? input.knownTaskMaterials.sourceTaskIds
+            : [],
+          deep_read: Boolean(input.knownTaskMaterials?.deepRead),
+        },
       },
       null,
       2,
@@ -312,6 +351,42 @@ function makeJudgeError(error: unknown): JudgeResult {
   }
 }
 
+async function snapshotOutputsForJudge(input: {
+  taskRun: SourceAgentTurnInput['taskRun']
+  round: number
+}): Promise<void> {
+  const snapshotDir = join(
+    input.taskRun.logsDir,
+    'submissions',
+    `round_${String(input.round).padStart(2, '0')}`,
+  )
+  await mkdir(snapshotDir, { recursive: true })
+  if (!existsSync(input.taskRun.outputsDir)) return
+  await cp(input.taskRun.outputsDir, snapshotDir, {
+    recursive: true,
+    force: true,
+  })
+}
+
+function extractKnownTaskMaterialsPromptBlock(prompt: string): string | undefined {
+  return prompt.match(/<known_task_materials>[\s\S]*?<\/known_task_materials>/)?.[0]
+}
+
+function knownTaskMaterialsPromptMode(
+  block: string | undefined,
+): 'minimal' | 'deep_read' | 'none' {
+  if (!block) return 'none'
+  if (block === KNOWN_TASK_MATERIALS_PROMPT_BLOCK) return 'minimal'
+  if (block === KNOWN_TASK_MATERIALS_DEEP_READ_PROMPT_BLOCK) return 'deep_read'
+  if (
+    block.includes('Additional readable materials are available under public/known_tasks/.') &&
+    block.includes('Before implementation or long experiments')
+  ) {
+    return 'deep_read'
+  }
+  return 'none'
+}
+
 async function createDefaultSourceSession(
   input: SourceAgentStartInput,
 ): Promise<SourceAgentSession> {
@@ -322,6 +397,7 @@ async function createDefaultSourceSession(
 export async function runSourceTaskLoop(
   input: RunSourceTaskLoopInput,
 ): Promise<RunSourceTaskLoopResult> {
+  validateEvaluationNetworkPolicy(input.contextOptions)
   const startedAt = new Date().toISOString()
   const deadline = Date.now() + input.timeoutSeconds * 1000
   const maxTurnsPerRound = input.maxTurnsPerRound
@@ -330,6 +406,7 @@ export async function runSourceTaskLoop(
     tasksDir: input.tasksDir ? resolve(input.tasksDir) : undefined,
     runsDir: input.runsDir ? resolve(input.runsDir) : undefined,
     timestamp: input.timestamp,
+    knownTaskMaterials: input.knownTaskMaterials,
   })
   const eventLogger = new RunEventLogger({
     taskRun,
@@ -377,6 +454,7 @@ export async function runSourceTaskLoop(
       runMetadata,
       validationAttempts: aggregation.validationAttempts,
       warnings: aggregation.warnings,
+      knownTaskMaterials: input.knownTaskMaterials,
     })
     return {
       status: 'infra_error',
@@ -393,30 +471,92 @@ export async function runSourceTaskLoop(
     runtimePython: runtime.displayPath,
     runMetadata,
   })
+  let resumeContext: ResumeRunSnapshot | undefined
+  if (input.contextOptions?.resumeRun) {
+    resumeContext = await loadResumeRunSnapshot(input.contextOptions.resumeRun, {
+      runsRoot: taskRun.runDir ? join(taskRun.runDir, '..') : input.runsDir,
+      expectedTaskId: taskRun.taskId,
+    })
+    await trajectory.agentEvent(0, {
+      type: 'context_event',
+      subtype: 'resume_loaded',
+      message: resumeContext.runDir,
+      metadata: {
+        taskId: resumeContext.taskId,
+        contextEvents: resumeContext.contextEvents.length,
+      },
+    })
+  }
   const userTask = await loadUserTask(taskRun.publicDir)
-  const session = await (input.sessionFactory ?? createDefaultSourceSession)({
-    taskRun,
-    maxRounds: input.maxRounds,
-    maxTurnsPerRound,
-    userTask,
-    runtime,
-    systemPrompt: input.systemPrompt,
-    llmOptions: input.llmOptions,
-  })
+  const makeSession = () =>
+    (input.sessionFactory ?? createDefaultSourceSession)({
+      taskRun,
+      maxRounds: input.maxRounds,
+      maxTurnsPerRound,
+      userTask,
+      runtime,
+      systemPrompt: input.systemPrompt,
+      userPrompt: input.userPrompt,
+      llmOptions: input.llmOptions,
+      skillOptions: input.skillOptions,
+      contextOptions: input.contextOptions,
+    })
+  let session = await makeSession()
+  const signalHandlers = new Map<(typeof TERMINATION_SIGNALS)[number], () => void>()
+  for (const signal of TERMINATION_SIGNALS) {
+    const handler = () => {
+      session.interrupt?.(signal)
+      void disposeSessionWithTimeout(
+        session,
+        eventLogger,
+        input.sessionDisposeGraceMs,
+      ).finally(() => process.exit(exitCodeForSignal(signal)))
+    }
+    signalHandlers.set(signal, handler)
+    process.once(signal, handler)
+  }
   const judge = input.judge ?? new DefaultJudgeRunner()
 
   let finalStatus: LoopStatus = 'failed'
   let finalReward = 0
   let finalResult: unknown = { message: 'No judge rounds completed.' }
   let lastJudgeResult: JudgeResult | undefined
+  let runMemory: RunMemorySnapshot | undefined
   let judgeRoundsCompleted = 0
+  const networkPolicy = normalizeEvaluationNetworkPolicy(input.contextOptions?.networkPolicy)
+  const agentToolAvailable = canUseEvaluationAgentTool(input.contextOptions)
   let nextPrompt = await buildInitialSourcePrompt({
     taskRun,
     runtime,
     userTask,
     maxRounds: input.maxRounds,
-    priorSubtasks: input.priorSubtasks,
+    hasKnownTaskMaterials: Boolean(input.knownTaskMaterials?.enabled),
+    knownTaskMaterialsDeepRead: Boolean(input.knownTaskMaterials?.deepRead),
+    hasActiveSkills: Boolean(input.skillOptions?.enabled),
+    activeSkillNames: input.skillOptions?.allowedSkillNames,
+    networkPolicy,
+    agentToolAvailable,
+    userPrompt: input.userPrompt,
+    resumeContext,
   })
+  const knownTaskMaterialsPromptBlock =
+    extractKnownTaskMaterialsPromptBlock(nextPrompt)
+  const knownPromptMode = knownTaskMaterialsPromptMode(
+    knownTaskMaterialsPromptBlock,
+  )
+  await trajectory.appendClean({
+    kind: 'initial_prompt_audit',
+    expected_known_task_materials_block: Boolean(input.knownTaskMaterials?.enabled),
+    has_known_task_materials_block: Boolean(knownTaskMaterialsPromptBlock),
+    known_task_materials_block_allowed: knownTaskMaterialsPromptBlock
+      ? knownPromptMode !== 'none'
+      : !input.knownTaskMaterials?.enabled,
+    known_task_materials_prompt_mode: knownPromptMode,
+    known_task_materials_deep_read_requested: Boolean(
+      input.knownTaskMaterials?.deepRead,
+    ),
+  })
+  const promptTooLongRecoveredRounds = new Set<number>()
 
   try {
     while (judgeRoundsCompleted < input.maxRounds) {
@@ -431,19 +571,83 @@ export async function runSourceTaskLoop(
         judge_round: round,
         message: 'Submitting prompt to source-native QueryEngine session',
       })
-      const { finalized } = await runAgentStepWithRecovery({
-        session,
-        taskRun,
-        runtime,
-        round,
-        maxRounds: input.maxRounds,
-        maxTurnsPerRound,
-        prompt: nextPrompt,
-        deadline,
-        trajectory,
-        eventLogger,
-        aggregation,
-      })
+      let finalized: Extract<SourceAgentEvent, { type: 'finalize' }> | undefined
+      try {
+        const result = await runAgentStepWithRecovery({
+          session,
+          taskRun,
+          runtime,
+          round,
+          maxRounds: input.maxRounds,
+          maxTurnsPerRound,
+          prompt: nextPrompt,
+          deadline,
+          trajectory,
+          eventLogger,
+          aggregation,
+        })
+        finalized = result.finalized
+      } catch (error) {
+        if (
+          !isPromptTooLongError(error) ||
+          promptTooLongRecoveredRounds.has(round) ||
+          Date.now() >= deadline
+        ) {
+          throw error
+        }
+        promptTooLongRecoveredRounds.add(round)
+        await trajectory.agentEvent(round, {
+          type: 'context_event',
+          subtype: 'prompt_too_long',
+          message: errorMessage(error),
+          metadata: { action: 'fresh_session_recovery' },
+        })
+        await eventLogger.log('prompt_too_long_recovery_started', {
+          judge_round: round,
+          message:
+            'Source agent hit prompt-too-long; restarting a fresh session with compact recovery context',
+          details: { error: errorMessage(error) },
+        })
+        await disposeSessionWithTimeout(
+          session,
+          eventLogger,
+          input.sessionDisposeGraceMs,
+        )
+        session = await makeSession()
+        const recoveryPrompt = buildPromptTooLongRecoveryPrompt({
+          round,
+          maxRounds: input.maxRounds,
+          judgeResult: lastJudgeResult,
+          hasActiveSkills:
+            Boolean(input.skillOptions?.enabled) &&
+            input.contextOptions?.reInjectActiveSkillsEachRound !== false,
+          activeSkillNames: input.skillOptions?.allowedSkillNames,
+          userPrompt: input.userPrompt,
+          runMemory: runMemory
+            ? { path: 'workspace/agent_memory.md', content: runMemory.content }
+            : undefined,
+        })
+        const recoveryResult = await runAgentStepWithRecovery({
+          session,
+          taskRun,
+          runtime,
+          round,
+          maxRounds: input.maxRounds,
+          maxTurnsPerRound,
+          prompt: recoveryPrompt,
+          deadline,
+          trajectory,
+          eventLogger,
+          aggregation,
+        })
+        finalized = recoveryResult.finalized
+        await eventLogger.log('prompt_too_long_recovery_finished', {
+          judge_round: round,
+          message: finalized
+            ? `fresh_session_finalize_submission: ${finalized.summary}`
+            : 'Fresh session recovery ended without finalize_submission',
+        })
+      }
       await eventLogger.log('agent_step_finished', {
         judge_round: round,
         message: finalized
@@ -461,6 +665,7 @@ export async function runSourceTaskLoop(
       }
 
       judgeRoundsCompleted++
+      await snapshotOutputsForJudge({ taskRun, round })
       await eventLogger.log('judge_started', {
         judge_round: round,
         message: `Running judge attempt ${judgeRoundsCompleted}/${input.maxRounds}`,
@@ -473,6 +678,7 @@ export async function runSourceTaskLoop(
             runtime,
             round,
             timeoutSeconds: Math.ceil(remainingMilliseconds(deadline) / 1000),
+            feedbackLevel: input.judgeFeedbackLevel,
           }),
           remainingMilliseconds(deadline),
           'Judge',
@@ -523,10 +729,30 @@ export async function runSourceTaskLoop(
         finalStatus = 'failed'
         break
       }
+      if (input.contextOptions?.runMemory) {
+        runMemory = await writeRunMemory({
+          taskRun,
+          trajectoryPath: trajectory.cleanPath,
+          latestJudgeResult: judgeResult,
+        })
+        await trajectory.agentEvent(round, {
+          type: 'context_event',
+          subtype: 'run_memory_written',
+          message: runMemory.path,
+        })
+      }
       nextPrompt = buildJudgeFeedbackPrompt({
         round,
         maxRounds: input.maxRounds,
         judgeResult,
+        hasActiveSkills:
+          Boolean(input.skillOptions?.enabled) &&
+          input.contextOptions?.reInjectActiveSkillsEachRound !== false,
+        activeSkillNames: input.skillOptions?.allowedSkillNames,
+        userPrompt: input.userPrompt,
+        runMemory: runMemory
+          ? { path: 'workspace/agent_memory.md', content: runMemory.content }
+          : undefined,
       })
     }
   } catch (error) {
@@ -539,6 +765,10 @@ export async function runSourceTaskLoop(
       message: errorMessage(error),
     })
   } finally {
+    for (const [signal, handler] of signalHandlers) {
+      process.off(signal, handler)
+    }
+    signalHandlers.clear()
     await disposeSessionWithTimeout(
       session,
       eventLogger,
@@ -572,6 +802,7 @@ export async function runSourceTaskLoop(
     runMetadata,
     validationAttempts: aggregation.validationAttempts,
     warnings: aggregation.warnings,
+    knownTaskMaterials: input.knownTaskMaterials,
   })
 
   return {

@@ -229,6 +229,390 @@ describe('runSourceTaskLoop', () => {
     expect(raw).toContain('"kind":"judge_result_raw"')
   })
 
+  test('passes judge feedback level and snapshots outputs before judging', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'source-loop-judge-feedback-'))
+    const tasksDir = join(root, 'tasks')
+    const runsDir = join(root, 'runs')
+    await makeTask(tasksDir, 'feedback_task', true)
+    const feedbackLevels: Array<string | undefined> = []
+
+    const result = await runSourceTaskLoop({
+      taskId: 'feedback_task',
+      tasksDir,
+      runsDir,
+      maxRounds: 1,
+      timeoutSeconds: 30,
+      judgeFeedbackLevel: 'metric_full',
+      sessionFactory: async () => ({
+        async *submit(input: SourceAgentTurnInput) {
+          await mkdir(input.taskRun.outputsDir, { recursive: true })
+          await writeFile(join(input.taskRun.outputsDir, 'case_000.npz'), 'snapshot me', 'utf8')
+          yield {
+            type: 'submission_validation_passed',
+            result: {
+              ok: true,
+              normalizedFiles: ['outputs/case_000.npz'],
+              issues: [],
+            },
+          }
+          yield { type: 'finalize', summary: 'ready', files: ['outputs/case_000.npz'] }
+        },
+      }),
+      judge: {
+        async run(input) {
+          feedbackLevels.push(input.feedbackLevel)
+          return {
+            status: 'pass',
+            reward: 1,
+            feedback: 'ok',
+            raw: { status: 'pass' },
+          }
+        },
+      },
+    })
+
+    expect(result.status).toBe('success')
+    expect(feedbackLevels).toEqual(['metric_full'])
+    expect(
+      existsSync(join(result.run.logsDir, 'submissions', 'round_01', 'case_000.npz')),
+    ).toBe(true)
+  })
+
+  test('writes run memory and reinjects active skills after failed judge round', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'source-loop-run-memory-'))
+    const tasksDir = join(root, 'tasks')
+    const runsDir = join(root, 'runs')
+    await makeTask(tasksDir, 'memory_task', true)
+    const prompts: string[] = []
+
+    const result = await runSourceTaskLoop({
+      taskId: 'memory_task',
+      tasksDir,
+      runsDir,
+      maxRounds: 2,
+      timeoutSeconds: 30,
+      contextOptions: {
+        profile: 'eval-safe-claude-parity',
+        networkPolicy: 'disabled',
+        runMemory: true,
+        recordContextEvents: true,
+        reInjectActiveSkillsEachRound: true,
+        includeClaudeDefaultUserContext: false,
+        enableSlashCommands: false,
+        enableMcpClients: false,
+        enableAgentTool: false,
+      },
+      skillOptions: {
+        enabled: true,
+        mode: 'native',
+        skillsDir: 'skills',
+        allowedSkillNames: ['general-skill'],
+      },
+      sessionFactory: async () => ({
+        async *submit(input: SourceAgentTurnInput) {
+          prompts.push(input.prompt)
+          yield { type: 'tool_call', tool: 'Read', input: { file_path: 'public/README.md' } }
+          yield { type: 'finalize', summary: 'ready', files: [] }
+        },
+      }),
+      judge: {
+        async run() {
+          return prompts.length === 1
+            ? {
+                status: 'fail',
+                reward: 0,
+                feedback: 'nrmse too high',
+                raw: {
+                  cases: [
+                    {
+                      metrics: [{ name: 'nrmse', status: 'fail' }],
+                    },
+                  ],
+                },
+              }
+            : {
+                status: 'pass',
+                reward: 1,
+                feedback: 'ok',
+                raw: { status: 'pass' },
+              }
+        },
+      },
+    })
+
+    expect(result.status).toBe('success')
+    expect(prompts).toHaveLength(2)
+    expect(prompts[1]).toContain('<run_memory>')
+    expect(prompts[1]).toContain('workspace/agent_memory.md')
+    expect(prompts[1]).toContain('<active_skills>')
+    expect(prompts[1]).toContain('general-skill')
+    expect(existsSync(join(result.run.workspaceDir, 'agent_memory.md'))).toBe(true)
+    const clean = await readFile(join(result.run.logsDir, 'trajectory.clean.jsonl'), 'utf8')
+    expect(clean).toContain('"kind":"context_event"')
+    expect(clean).toContain('"subtype":"run_memory_written"')
+  })
+
+  test('loads resume context into initial prompt', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'source-loop-resume-'))
+    const tasksDir = join(root, 'tasks')
+    const runsDir = join(root, 'runs')
+    await makeTask(tasksDir, 'resume_task', true)
+    const resumeDir = join(runsDir, 'resume_task_old')
+    await mkdir(join(resumeDir, 'workspace'), { recursive: true })
+    await mkdir(join(resumeDir, 'logs'), { recursive: true })
+    await writeFile(
+      join(resumeDir, 'run_manifest.json'),
+      JSON.stringify({ task_id: 'resume_task', run_id: 'resume_task_old' }),
+      'utf8',
+    )
+    await writeFile(join(resumeDir, 'workspace', 'plan.md'), '# Old plan', 'utf8')
+    await writeFile(join(resumeDir, 'workspace', 'agent_memory.md'), '# Old memory', 'utf8')
+    await writeFile(
+      join(resumeDir, 'logs', 'trajectory.clean.jsonl'),
+      JSON.stringify({ kind: 'context_event', round: 1, subtype: 'compact_boundary', message: 'compacted' }),
+      'utf8',
+    )
+    const prompts: string[] = []
+
+    const result = await runSourceTaskLoop({
+      taskId: 'resume_task',
+      tasksDir,
+      runsDir,
+      maxRounds: 1,
+      timeoutSeconds: 30,
+      contextOptions: {
+        profile: 'eval-safe-claude-parity',
+        networkPolicy: 'disabled',
+        runMemory: true,
+        resumeRun: resumeDir,
+        recordContextEvents: true,
+        reInjectActiveSkillsEachRound: true,
+        includeClaudeDefaultUserContext: false,
+        enableSlashCommands: false,
+        enableMcpClients: false,
+        enableAgentTool: false,
+      },
+      sessionFactory: async () => ({
+        async *submit(input: SourceAgentTurnInput) {
+          prompts.push(input.prompt)
+          yield { type: 'finalize', summary: 'ready', files: [] }
+        },
+      }),
+      judge: {
+        async run() {
+          return {
+            status: 'pass',
+            reward: 1,
+            feedback: 'ok',
+            raw: { status: 'pass' },
+          }
+        },
+      },
+    })
+
+    expect(result.status).toBe('success')
+    expect(prompts[0]).toContain('<resume_context>')
+    expect(prompts[0]).toContain('Old plan')
+    expect(prompts[0]).toContain('Old memory')
+    const clean = await readFile(join(result.run.logsDir, 'trajectory.clean.jsonl'), 'utf8')
+    expect(clean).toContain('"subtype":"resume_loaded"')
+  })
+
+  test('rejects resume context from a different task before creating a session', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'source-loop-resume-cross-task-'))
+    const tasksDir = join(root, 'tasks')
+    const runsDir = join(root, 'runs')
+    await makeTask(tasksDir, 'current_task', true)
+    const resumeDir = join(runsDir, 'old_task_run')
+    await mkdir(join(resumeDir, 'workspace'), { recursive: true })
+    await mkdir(join(resumeDir, 'logs'), { recursive: true })
+    await writeFile(
+      join(resumeDir, 'run_manifest.json'),
+      JSON.stringify({ task_id: 'old_task', run_id: 'old_task_run' }),
+      'utf8',
+    )
+    let sessionCreations = 0
+
+    await expect(
+      runSourceTaskLoop({
+        taskId: 'current_task',
+        tasksDir,
+        runsDir,
+        maxRounds: 1,
+        timeoutSeconds: 30,
+        contextOptions: {
+          profile: 'eval-safe-claude-parity',
+          networkPolicy: 'disabled',
+          runMemory: true,
+          resumeRun: resumeDir,
+          recordContextEvents: true,
+          reInjectActiveSkillsEachRound: true,
+          includeClaudeDefaultUserContext: false,
+          enableSlashCommands: false,
+          enableMcpClients: false,
+          enableAgentTool: false,
+        },
+        sessionFactory: async () => {
+          sessionCreations++
+          throw new Error('should not create session for cross-task resume')
+        },
+        judge: {
+          async run() {
+            throw new Error('judge should not run')
+          },
+        },
+      }),
+    ).rejects.toThrow('does not match current task')
+    expect(sessionCreations).toBe(0)
+  })
+
+  test('passes known task materials into run setup and initial prompt summary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'source-loop-known-materials-'))
+    const tasksDir = join(root, 'tasks')
+    const runsDir = join(root, 'runs')
+    await makeTask(tasksDir, 'usct_FWI', true)
+    await makeTask(tasksDir, 'ultrasound_sos_tomography', true)
+    await mkdir(join(tasksDir, 'ultrasound_sos_tomography', 'std_code'), {
+      recursive: true,
+    })
+    await writeFile(
+      join(tasksDir, 'ultrasound_sos_tomography', 'std_code', 'main.py'),
+      'print("known")',
+      'utf8',
+    )
+    const prompts: string[] = []
+
+    const result = await runSourceTaskLoop({
+      taskId: 'usct_FWI',
+      tasksDir,
+      runsDir,
+      maxRounds: 1,
+      timeoutSeconds: 30,
+      knownTaskMaterials: {
+        enabled: true,
+        sourceTaskIds: ['ultrasound_sos_tomography'],
+      },
+      sessionFactory: async () => ({
+        async *submit(input: SourceAgentTurnInput) {
+          prompts.push(input.prompt)
+          yield { type: 'finalize', summary: 'ready', files: [] }
+        },
+      }),
+      judge: {
+        async run() {
+          return {
+            status: 'pass',
+            reward: 1,
+            feedback: 'ok',
+            raw: { status: 'pass' },
+          }
+        },
+      },
+    })
+
+    expect(result.status).toBe('success')
+    expect(
+      existsSync(
+        join(
+          result.run.publicDir,
+          'known_tasks',
+          'ultrasound_sos_tomography',
+          'README.md',
+        ),
+      ),
+    ).toBe(true)
+    expect(
+      existsSync(
+        join(
+          result.run.publicDir,
+          'known_tasks',
+          'ultrasound_sos_tomography',
+          'std_code',
+          'main.py',
+        ),
+      ),
+    ).toBe(true)
+    expect(prompts[0]).toContain('<known_task_materials>')
+    expect(prompts[0]).toContain('public/known_tasks/')
+
+    const clean = await readFile(join(result.run.logsDir, 'trajectory.clean.jsonl'), 'utf8')
+    expect(clean).toContain('"kind":"initial_prompt_audit"')
+    expect(clean).toContain('"expected_known_task_materials_block":true')
+    expect(clean).toContain('"has_known_task_materials_block":true')
+    expect(clean).toContain('"known_task_materials_block_allowed":true')
+
+    const summary = JSON.parse(
+      await readFile(join(result.run.logsDir, 'run_summary.json'), 'utf8'),
+    )
+    expect(summary.known_task_materials).toEqual({
+      enabled: true,
+      source_task_ids: ['ultrasound_sos_tomography'],
+      deep_read: false,
+    })
+  })
+
+  test('records known task deep-read prompt mode in trajectory and summary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'source-loop-known-materials-deep-'))
+    const tasksDir = join(root, 'tasks')
+    const runsDir = join(root, 'runs')
+    await makeTask(tasksDir, 'usct_FWI', true)
+    await makeTask(tasksDir, 'ultrasound_sos_tomography', true)
+    await mkdir(join(tasksDir, 'ultrasound_sos_tomography', 'std_code'), {
+      recursive: true,
+    })
+    await writeFile(
+      join(tasksDir, 'ultrasound_sos_tomography', 'std_code', 'main.py'),
+      'print("known")',
+      'utf8',
+    )
+    const prompts: string[] = []
+
+    const result = await runSourceTaskLoop({
+      taskId: 'usct_FWI',
+      tasksDir,
+      runsDir,
+      maxRounds: 1,
+      timeoutSeconds: 30,
+      knownTaskMaterials: {
+        enabled: true,
+        sourceTaskIds: ['ultrasound_sos_tomography'],
+        deepRead: true,
+      },
+      sessionFactory: async () => ({
+        async *submit(input: SourceAgentTurnInput) {
+          prompts.push(input.prompt)
+          yield { type: 'finalize', summary: 'ready', files: [] }
+        },
+      }),
+      judge: {
+        async run() {
+          return {
+            status: 'pass',
+            reward: 1,
+            feedback: 'ok',
+            raw: { status: 'pass' },
+          }
+        },
+      },
+    })
+
+    expect(result.status).toBe('success')
+    expect(prompts[0]).toContain('workspace/known_task_materials_notes.md')
+
+    const clean = await readFile(join(result.run.logsDir, 'trajectory.clean.jsonl'), 'utf8')
+    expect(clean).toContain('"known_task_materials_prompt_mode":"deep_read"')
+    expect(clean).toContain('"known_task_materials_deep_read_requested":true')
+
+    const summary = JSON.parse(
+      await readFile(join(result.run.logsDir, 'run_summary.json'), 'utf8'),
+    )
+    expect(summary.known_task_materials).toEqual({
+      enabled: true,
+      source_task_ids: ['ultrasound_sos_tomography'],
+      deep_read: true,
+    })
+  })
+
   test('returns infra_error before creating a session when runtime is missing', async () => {
     const root = await mkdtemp(join(tmpdir(), 'source-loop-infra-'))
     const tasksDir = join(root, 'tasks')
@@ -390,6 +774,80 @@ describe('runSourceTaskLoop', () => {
     expect(clean).toContain('"kind":"recovery_finished"')
     expect(clean).toContain('"finalized":true')
     expect(clean).toContain('ready after recovery')
+  })
+
+  test('restarts with a fresh session and compact recovery prompt after prompt-too-long', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'source-loop-prompt-too-long-'))
+    const tasksDir = join(root, 'tasks')
+    const runsDir = join(root, 'runs')
+    await makeTask(tasksDir, 'prompt_too_long_task', true)
+    const prompts: string[] = []
+    const startUserPrompts: Array<string | undefined> = []
+    let sessionCreations = 0
+    let disposedSessions = 0
+    let judgeCalls = 0
+
+    const result = await runSourceTaskLoop({
+      taskId: 'prompt_too_long_task',
+      tasksDir,
+      runsDir,
+      maxRounds: 1,
+      timeoutSeconds: 30,
+      userPrompt: 'Use visual model checks only; do not compute GT-only image metrics.',
+      sessionFactory: async input => {
+        sessionCreations++
+        const sessionId = sessionCreations
+        startUserPrompts.push(input.userPrompt)
+        return {
+          async *submit(turnInput: SourceAgentTurnInput) {
+            prompts.push(turnInput.prompt)
+            if (sessionId === 1) {
+              throw new Error('prompt is too long: context length exceeded')
+            }
+            yield { type: 'assistant_text', text: 'Recovered in a fresh session.' }
+            yield {
+              type: 'finalize',
+              summary: 'ready after prompt-too-long recovery',
+              files: ['outputs/case_000.npz'],
+            }
+          },
+          async dispose() {
+            disposedSessions++
+          },
+        }
+      },
+      judge: {
+        async run() {
+          judgeCalls++
+          return {
+            status: 'pass',
+            reward: 1,
+            feedback: 'ok',
+            raw: { status: 'pass' },
+          }
+        },
+      },
+    })
+
+    expect(result.status).toBe('success')
+    expect(sessionCreations).toBe(2)
+    expect(disposedSessions).toBe(2)
+    expect(judgeCalls).toBe(1)
+    expect(startUserPrompts).toEqual([
+      'Use visual model checks only; do not compute GT-only image metrics.',
+      'Use visual model checks only; do not compute GT-only image metrics.',
+    ])
+    expect(prompts[0]).toContain('<user_prompt>')
+    expect(prompts[1]).toContain('<prompt_too_long_recovery>')
+    expect(prompts[1]).toContain('<user_prompt>')
+    expect(prompts[1]).toContain('Use visual model checks only')
+    expect(prompts[1]).toContain('Do not restart broad exploration')
+
+    const events = await readFile(join(result.run.logsDir, 'run_events.jsonl'), 'utf8')
+    expect(events).toContain('prompt_too_long_recovery_started')
+
+    const clean = await readFile(join(result.run.logsDir, 'trajectory.clean.jsonl'), 'utf8')
+    expect(clean).toContain('"subtype":"prompt_too_long"')
   })
 
   test('does not judge or consume a round when validation never passes', async () => {

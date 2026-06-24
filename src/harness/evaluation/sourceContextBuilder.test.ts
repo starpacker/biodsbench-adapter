@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from 'fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { describe, expect, test } from 'bun:test'
@@ -75,7 +75,7 @@ const runtime: RuntimeInfo = {
 }
 
 describe('sourceContextBuilder', () => {
-  test('builds a lean system contract with artifact planning and no TodoWrite', () => {
+  test('builds a lean system contract with artifact planning and TodoWrite scratchpad', () => {
     const prompt = buildSourceSystemPrompt()
 
     expect(prompt).toContain('source-native evaluation harness')
@@ -84,7 +84,16 @@ describe('sourceContextBuilder', () => {
     expect(prompt).toContain('submit the best available valid output')
     expect(prompt).toContain('workspace/experiments/')
     expect(prompt).toContain('Do not put long Python programs in Bash python -c')
-    expect(prompt).toContain('Do not use TodoWrite')
+    expect(prompt).toContain('python -u')
+    expect(prompt).toContain('do not launch duplicate long-running processes')
+    expect(prompt).toContain('do not replace them with TodoWrite items')
+    expect(prompt).toContain('TodoWrite as scratchpad')
+    expect(prompt).not.toContain('Coordinator/subagent discipline')
+    expect(prompt).not.toContain('Agent subagents')
+    expect(prompt).not.toContain('Subagent delegation plan')
+    expect(prompt).not.toContain('Network access is disabled')
+    expect(prompt).not.toContain('GPU-first Torch discipline')
+    expect(prompt).not.toContain('Anti-overoptimization discipline')
     expect(prompt).not.toContain('Current working directory:')
   })
 
@@ -108,9 +117,239 @@ describe('sourceContextBuilder', () => {
     expect(prompt).toContain('workspace/experiments/')
     expect(prompt).toContain('judge feedback is more valuable than private speculation')
     expect(prompt).toContain('raw keys, shapes, dtypes, finite status, and value ranges')
+    expect(prompt).toContain('Treat public README/case params/metadata as authoritative')
+    expect(prompt).toContain('do not reuse older defaults from memory, skills, or prior runs')
+    expect(prompt).toContain('record the public parameter source, planned count, observed per-iteration time')
+    expect(prompt).not.toContain('objective/formula/convention audit')
+    expect(prompt).not.toContain('network_policy:')
+    expect(prompt).not.toContain('local-only audit')
+    expect(prompt).not.toContain('Subagent delegation plan')
+    expect(prompt).not.toContain('Agent tool is available')
+    expect(prompt).not.toContain('step size, preconditioner, smoothing')
     expect(prompt).not.toContain(taskRun.runDir)
     expect(prompt).not.toContain('HARNESS_HINTS')
     expect(prompt).not.toContain('must read public/output_schema.json')
+  })
+
+  test('injects dynamic user prompt into user messages, not system prompt', async () => {
+    const taskRun = await fakeTaskRun()
+    const userPrompt = [
+      'Task-specific constraints:',
+      '- Use the Agent tool only for bounded audits.',
+      '- Vision checks are allowed, but no GT-only image metrics.',
+    ].join('\n')
+
+    const initial = await buildInitialSourcePrompt({
+      taskRun,
+      runtime,
+      userTask: '# Demo Task\nSolve it.\n',
+      maxRounds: 5,
+      hasKnownTaskMaterials: true,
+      userPrompt,
+    })
+    const judge = buildJudgeFeedbackPrompt({
+      round: 1,
+      maxRounds: 5,
+      judgeResult: {
+        status: 'fail',
+        reward: 0,
+        feedback: 'needs a focused fix',
+        raw: {},
+      },
+      userPrompt,
+    })
+
+    expect(initial).toContain('<user_prompt>')
+    expect(initial).toContain('Task-specific constraints:')
+    expect(initial).toContain('Vision checks are allowed')
+    expect(initial.indexOf('</visible_cases>')).toBeLessThan(
+      initial.indexOf('<user_prompt>'),
+    )
+    expect(initial.indexOf('<user_prompt>')).toBeLessThan(
+      initial.indexOf('<known_task_materials>'),
+    )
+    expect(judge).toContain('<user_prompt>')
+    expect(judge).toContain('Task-specific constraints:')
+    expect(buildSourceSystemPrompt()).not.toContain('Task-specific constraints:')
+  })
+
+  test('usct FWI recovery user prompt requires README-compliant CBS FWI', async () => {
+    const prompt = await readFile(
+      'config/prompts/usct-fwi-known-ab-user-prompt-v2.md',
+      'utf8',
+    )
+
+    expect(prompt).toContain('README.md is the highest-priority task specification')
+    expect(prompt).toContain('frequency-domain Full-Waveform Inversion with a Convergent Born Series')
+    expect(prompt).toContain('Do not submit amplitude backprojection')
+    expect(prompt).toContain('straight-ray travel-time tomography')
+    expect(prompt).toContain('phase-only LSQR')
+    expect(prompt).toContain('NCC is not a success signal')
+    expect(prompt).toContain('Do not call `finalize_submission`')
+    expect(prompt).toContain('README compliance checklist')
+    expect(prompt).toContain('Use the POSIX Torch runtime through `python` from PATH')
+    expect(prompt).toContain('run a CUDA probe')
+    expect(prompt).toContain('prefer CUDA for Torch tensors')
+    expect(prompt).toContain('device = torch.device("cuda" if torch.cuda.is_available() else "cpu")')
+    expect(prompt).not.toContain('If full CBS/FWI is too slow or unstable')
+  })
+
+  test('mentions known task materials only when configured', async () => {
+    const taskRun = await fakeTaskRun()
+    await mkdir(join(taskRun.publicDir, 'known_tasks', 'source-a', 'std_code'), {
+      recursive: true,
+    })
+    await writeFile(
+      join(taskRun.publicDir, 'known_tasks', 'source-a', 'README.md'),
+      '# Source A',
+      'utf8',
+    )
+    await writeFile(
+      join(taskRun.publicDir, 'known_tasks', 'source-a', 'std_code', 'main.py'),
+      'print("known")',
+      'utf8',
+    )
+    const prompt = await buildInitialSourcePrompt({
+      taskRun,
+      runtime,
+      userTask: '# Demo Task\nSolve it.\n',
+      maxRounds: 5,
+      hasKnownTaskMaterials: true,
+    })
+
+    const knownBlock = prompt.match(
+      /<known_task_materials>[\s\S]*<\/known_task_materials>/,
+    )?.[0]
+    expect(knownBlock).toContain('<known_task_materials>')
+    expect(knownBlock).toContain('public/known_tasks/')
+    expect(prompt).not.toContain('known_tasks/source-a/README.md')
+    expect(prompt).not.toContain('known_tasks/source-a/std_code/main.py')
+    expect(knownBlock).not.toContain('README.md')
+    expect(knownBlock).not.toContain('std_code')
+    expect(knownBlock).not.toContain('prior')
+    expect(knownBlock).not.toContain('source task')
+    expect(knownBlock).not.toContain('transfer')
+    expect(knownBlock).not.toContain('hypothesis')
+    expect(knownBlock).not.toContain('ultrasound_sos_tomography helps')
+
+    const baselinePrompt = await buildInitialSourcePrompt({
+      taskRun,
+      runtime,
+      userTask: '# Demo Task\nSolve it.\n',
+      maxRounds: 5,
+    })
+    expect(baselinePrompt).not.toContain('<known_task_materials>')
+  })
+
+  test('asks the source agent to inspect active skills only when configured', async () => {
+    const taskRun = await fakeTaskRun()
+    const prompt = await buildInitialSourcePrompt({
+      taskRun,
+      runtime,
+      userTask: '# Demo Task\nSolve it.\n',
+      maxRounds: 5,
+      hasActiveSkills: true,
+      activeSkillNames: ['wave-inversion-checks', 'runtime-budgeting'],
+    })
+
+    const skillBlock = prompt.match(/<active_skills>[\s\S]*<\/active_skills>/)?.[0]
+    expect(skillBlock).toContain('Skill tool is enabled')
+    expect(skillBlock).toContain('call the Skill tool')
+    expect(skillBlock).toContain('Applied skills checklist')
+    expect(skillBlock).toContain('workspace/skill_application.json')
+    expect(skillBlock).toContain('used, not_applicable, or blocked_but_overridden')
+    expect(skillBlock).toContain('cheap probe')
+    expect(skillBlock).toContain('stop condition')
+    expect(skillBlock).toContain('wave-inversion-checks')
+    expect(skillBlock).toContain('runtime-budgeting')
+    expect(skillBlock).not.toContain('known_tasks')
+    expect(skillBlock).not.toContain('std_code')
+    expect(skillBlock).not.toContain('ultrasound_sos_tomography')
+    expect(skillBlock).not.toContain('seismic_FWI_original')
+    expect(skillBlock).not.toContain('usct_FWI')
+
+    const baselinePrompt = await buildInitialSourcePrompt({
+      taskRun,
+      runtime,
+      userTask: '# Demo Task\nSolve it.\n',
+      maxRounds: 5,
+    })
+    expect(baselinePrompt).not.toContain('<active_skills>')
+  })
+
+  test('can request generic deep reading without naming transfer relationships', async () => {
+    const taskRun = await fakeTaskRun()
+    await mkdir(join(taskRun.publicDir, 'known_tasks', 'source-a', 'std_code'), {
+      recursive: true,
+    })
+    await writeFile(
+      join(taskRun.publicDir, 'known_tasks', 'source-a', 'README.md'),
+      '# Source A',
+      'utf8',
+    )
+    const prompt = await buildInitialSourcePrompt({
+      taskRun,
+      runtime,
+      userTask: '# Demo Task\nSolve it.\n',
+      maxRounds: 5,
+      hasKnownTaskMaterials: true,
+      knownTaskMaterialsDeepRead: true,
+    })
+
+    const knownBlock = prompt.match(
+      /<known_task_materials>[\s\S]*<\/known_task_materials>/,
+    )?.[0]
+    expect(knownBlock).toContain('public/known_tasks/')
+    expect(knownBlock).toContain('README.md')
+    expect(knownBlock).toContain('std_code')
+    expect(knownBlock).toContain('workspace/known_task_materials_notes.md')
+    expect(knownBlock).toContain('Known-task synthesis')
+    expect(knownBlock).toContain('reusable')
+    expect(knownBlock).toContain('paradigm mismatches')
+    expect(knownBlock).toContain('workspace/plans/round_NN.md')
+    expect(knownBlock).not.toContain('workspace/current_task_contract.md')
+    expect(knownBlock).not.toContain('current-contract-auditor')
+    expect(knownBlock).not.toContain('known-task-auditor')
+    expect(knownBlock).not.toContain('objective-compatibility-reviewer')
+    expect(knownBlock).not.toContain('experiment-risk-reviewer')
+    expect(knownBlock).not.toContain('failure-diagnostic-reviewer')
+    expect(knownBlock).not.toContain('compact decision memo')
+    expect(knownBlock).not.toContain('must not return raw file contents')
+    expect(knownBlock).not.toContain('must not return image payloads')
+    expect(knownBlock).not.toContain('reuse_as_is')
+    expect(knownBlock).not.toContain('adapt_with_contract_check')
+    expect(knownBlock).not.toContain('do_not_reuse')
+    expect(knownBlock).not.toContain('transfer')
+    expect(knownBlock).not.toContain('hypothesis')
+    expect(knownBlock).not.toContain('xray_ptychography_tike')
+    expect(knownBlock).not.toContain('conventional_ptychography')
+    expect(knownBlock).not.toContain('ultrasound_sos_tomography')
+    expect(knownBlock).not.toContain('seismic_FWI_original')
+    expect(knownBlock).not.toContain('usct_FWI')
+    expect(knownBlock).not.toContain('helps')
+  })
+
+  test('injects resume context into the initial prompt', async () => {
+    const taskRun = await fakeTaskRun()
+    const prompt = await buildInitialSourcePrompt({
+      taskRun,
+      runtime,
+      userTask: '# Demo Task\nSolve it.\n',
+      maxRounds: 5,
+      resumeContext: {
+        runDir: 'output/runs/old_run',
+        taskId: 'demo_task',
+        latestPlan: '# Previous plan',
+        runMemory: '# Previous memory',
+        contextEvents: [{ round: 1, subtype: 'compact_boundary', message: 'compacted' }],
+      },
+    })
+
+    expect(prompt).toContain('<resume_context>')
+    expect(prompt).toContain('output/runs/old_run')
+    expect(prompt).toContain('Previous plan')
+    expect(prompt).toContain('Previous memory')
+    expect(prompt).toContain('compact_boundary')
   })
 
   test('builds compact judge feedback with next round plan path', () => {
@@ -152,6 +391,38 @@ describe('sourceContextBuilder', () => {
     expect(prompt).toContain('revalidate outputs against the same contract')
     expect(prompt).not.toContain('.judge_private')
     expect(prompt).not.toContain('raw feedback should not be needed')
+    expect(prompt).not.toContain('<diagnostic_hint>')
+    expect(prompt).not.toContain('NCC passed while NRMSE failed')
+  })
+
+  test('reinjects active skills and run memory into judge feedback prompt', () => {
+    const judgeResult: JudgeResult = {
+      status: 'fail',
+      reward: 0,
+      feedback: 'format mismatch',
+      raw: {},
+    }
+
+    const prompt = buildJudgeFeedbackPrompt({
+      round: 1,
+      maxRounds: 3,
+      judgeResult,
+      hasActiveSkills: true,
+      activeSkillNames: ['general-skill'],
+      runMemory: {
+        path: 'workspace/agent_memory.md',
+        content: '- Tried baseline solver\n- Next: fix output dtype',
+      },
+    })
+
+    expect(prompt).toContain('<active_skills>')
+    expect(prompt).toContain('At the start of each judge round')
+    expect(prompt).toContain('Applied skills checklist')
+    expect(prompt).toContain('which skill contract item failed')
+    expect(prompt).toContain('general-skill')
+    expect(prompt).toContain('<run_memory>')
+    expect(prompt).toContain('workspace/agent_memory.md')
+    expect(prompt).toContain('fix output dtype')
   })
 
   test('builds no-finalize recovery prompt that forces same-round closure', () => {
@@ -164,100 +435,5 @@ describe('sourceContextBuilder', () => {
     expect(prompt).toContain('Do not start new open-ended research')
     expect(prompt).toContain('missing or invalid')
     expect(prompt).not.toContain('schema-valid')
-  })
-
-  test('omits <prior_subtasks> when priorSubtasks is empty or undefined', async () => {
-    const taskRun = await fakeTaskRun()
-    const promptNone = await buildInitialSourcePrompt({
-      taskRun,
-      runtime,
-      userTask: '# Demo Task\nSolve it.\n',
-      maxRounds: 5,
-    })
-    expect(promptNone).not.toContain('<prior_subtasks>')
-
-    const promptEmpty = await buildInitialSourcePrompt({
-      taskRun,
-      runtime,
-      userTask: '# Demo Task\nSolve it.\n',
-      maxRounds: 5,
-      priorSubtasks: [],
-    })
-    expect(promptEmpty).not.toContain('<prior_subtasks>')
-  })
-
-  test('injects <prior_subtasks> block with code, status, and feedback when supplied', async () => {
-    const taskRun = await fakeTaskRun()
-    const prompt = await buildInitialSourcePrompt({
-      taskRun,
-      runtime,
-      userTask: '# Demo Task\nSolve it.\n',
-      maxRounds: 5,
-      priorSubtasks: [
-        {
-          taskId: '25303977_0',
-          taskIdx: 0,
-          status: 'success',
-          passed: true,
-          description: 'Compute baseline counts from clinical.csv',
-          generatedCode: "import pandas as pd\ndf = pd.read_csv('public/data/clinical.csv')\nprint(len(df))\n",
-          judgeFeedback: 'status: pass, metrics all ok',
-          notes: 'clinical.csv has 245 rows, key column is patient_id',
-        },
-        {
-          taskId: '25303977_1',
-          taskIdx: 1,
-          status: 'failed',
-          passed: false,
-          description: 'Compute mean age by group',
-          generatedCode: '# failed attempt referenced wrong column "ages"',
-          judgeFeedback: 'failed_metrics: [mean_age]; reason: KeyError "ages" (correct: "age")',
-        },
-      ],
-    })
-
-    expect(prompt).toContain('<prior_subtasks>')
-    expect(prompt).toContain('continuing a serial multi-sub-task study')
-    expect(prompt).toContain('task_id: 25303977_0')
-    expect(prompt).toContain('judge_passed: true')
-    expect(prompt).toContain('<generated_code language="python">')
-    expect(prompt).toContain("pd.read_csv('public/data/clinical.csv')")
-    expect(prompt).toContain('clinical.csv has 245 rows')
-    expect(prompt).toContain('task_id: 25303977_1')
-    expect(prompt).toContain('judge_passed: false')
-    expect(prompt).toContain('KeyError "ages"')
-    expect(prompt).toContain('</prior_subtasks>')
-
-    // Prior block must appear before the actual task statement so the model
-    // reads context first.
-    const priorIdx = prompt.indexOf('<prior_subtasks>')
-    const taskIdx = prompt.indexOf('<task_statement>')
-    expect(priorIdx).toBeGreaterThan(-1)
-    expect(taskIdx).toBeGreaterThan(priorIdx)
-
-    // Existing required content must still be present.
-    expect(prompt).toContain('<output_contract>')
-    expect(prompt).toContain('round_plan_file: workspace/plans/round_01.md')
-  })
-
-  test('truncates oversized prior generated_code to keep prompts bounded', async () => {
-    const taskRun = await fakeTaskRun()
-    const big = 'x'.repeat(20000)
-    const prompt = await buildInitialSourcePrompt({
-      taskRun,
-      runtime,
-      userTask: '# Demo Task\nSolve it.\n',
-      maxRounds: 5,
-      priorSubtasks: [
-        {
-          taskId: '25303977_0',
-          generatedCode: big,
-        },
-      ],
-    })
-    expect(prompt).toContain('<prior_subtasks>')
-    expect(prompt).toContain('generated_code truncated')
-    // The huge raw string must not appear in full.
-    expect(prompt.length).toBeLessThan(big.length)
   })
 })

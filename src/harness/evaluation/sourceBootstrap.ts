@@ -14,15 +14,15 @@ const DEFAULT_SOURCE_MACRO = {
 }
 
 export function ensureSourceRuntimeGlobals(): void {
-  if (process.env.API_KEY && !process.env.ANTHROPIC_API_KEY) {
+  if (process.env.API_KEY) {
     process.env.ANTHROPIC_API_KEY = process.env.API_KEY
   }
-  if (process.env.BASE_URL && !process.env.ANTHROPIC_BASE_URL) {
+  if (process.env.BASE_URL) {
     process.env.ANTHROPIC_BASE_URL = process.env.BASE_URL
   }
   if (process.env.MODEL_NAME) {
-    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL ??= process.env.MODEL_NAME
-    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ??= process.env.MODEL_NAME
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = process.env.MODEL_NAME
+    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = process.env.MODEL_NAME
   }
   if ('MACRO' in globalThis) return
   Object.defineProperty(globalThis, 'MACRO', {

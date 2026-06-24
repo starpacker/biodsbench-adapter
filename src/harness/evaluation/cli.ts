@@ -2,11 +2,20 @@ import { readFile } from 'fs/promises'
 import { join } from 'path'
 import { runEvaluationBatch } from './batchRunner.js'
 import { DefaultJudgeRunner } from './judgeRunner.js'
+import {
+  DEFAULT_EVALUATION_NETWORK_POLICY,
+  validateEvaluationNetworkPolicy,
+} from './networkPolicy.js'
 import { runSourceTaskLoop } from './sourceTaskLoop.js'
 import type {
+  EvaluationContextOptions,
+  EvaluationNetworkPolicy,
+  EvaluationContextProfile,
+  EvaluationSkillOptions,
   EvaluationThinkingMode,
+  JudgeFeedbackLevel,
+  KnownTaskMaterialsOptions,
   LoopStatus,
-  PriorSubtaskContext,
 } from './types.js'
 
 export type AgentRuntime = 'source'
@@ -22,13 +31,17 @@ export type EvaluationCliArgs = {
   concurrency: number
   workerTimeoutGraceSeconds?: number
   systemPromptPath?: string
-  priorContextPath?: string
+  userPromptPaths: string[]
   timestamp?: string
   verbose: boolean
   agentRuntime: AgentRuntime
   workerRun: boolean
   temperature: number
   thinking: EvaluationThinkingMode
+  judgeFeedbackLevel?: JudgeFeedbackLevel
+  skillOptions: EvaluationSkillOptions
+  contextOptions: EvaluationContextOptions
+  knownTaskMaterials: KnownTaskMaterialsOptions
 }
 
 function usage(): string {
@@ -47,9 +60,28 @@ function usage(): string {
     '  --agent-runtime source      Agent runtime; legacy subprocess runtime has been removed',
     '  --temperature <number>      Model temperature when thinking is disabled (default: 1)',
     '  --thinking disabled|adaptive  Thinking mode for source runtime (default: disabled)',
+    '  --judge-feedback-level overall_only|case_only|metric_status|metric_value|metric_full',
+    '  --context-profile eval-minimal|eval-safe-claude-parity|full-claude-unsafe',
+    '  --enable-run-memory       Persist run-local memory between judge rounds',
+    '  --resume-run <run_dir>     Resume from an existing run directory and enable run memory',
+    '  --disable-context-events   Do not record context/compaction events',
+    '  --disable-auto-compact     Disable Claude auto-compact for compatibility debugging',
+    '  --disable-skill-reinject   Do not re-inject active skill reminders each judge round',
+    '  --include-claude-default-user-context  Include Claude Code default user context in safe parity mode',
+    '  --enable-slash-commands    Enable eval-safe slash command allowlist',
+    '  --enable-mcp               Enable eval-safe MCP allowlist',
+    '  --network-policy disabled|enabled  Harness network policy (default: disabled)',
+    '  --enable-agent-tool        Enable eval-safe AgentTool allowlist (requires --network-policy enabled; default: disabled)',
+    '  --disable-agent-tool       Disable AgentTool for this run',
+    '  --allow-unsafe-context     Required with full-claude-unsafe context profile',
+    '  --enable-skills             Enable native SkillTool for source runtime (default: disabled)',
+    '  --skills-dir <path>         Native skills directory when skills are enabled; repeat for overlays (default: skills)',
+    '  --skill-name <name>         Restrict native SkillTool to a specific skill name; repeatable',
+    '  --max-active-skills <n>     Maximum native skills exposed to the run after filtering',
+    '  --known-task <task_id>      Copy README.md, std_code/main.py, and std_code/src/ from a prior task into public/known_tasks/; repeatable',
+    '  --known-task-deep-read      Ask the source agent to inspect exposed known-task materials before implementation',
     '  --system-prompt <path>      Optional debug-only extra system prompt file (default: none)',
-    '  --prior-context <path>      JSON file with prior sub-task context for true-serial evaluation',
-    '                              (array of {taskId,status,passed,description,generatedCode,judgeFeedback,notes})',
+    '  --user-prompt <path>        Optional task-specific user prompt file; repeatable',
     '  --timestamp <value>         Stable timestamp/run suffix for reproducible tests',
     '  --quiet                     Do not print live run events to stderr',
   ].join('\n')
@@ -79,6 +111,54 @@ function parseTemperature(value: string, name: string): number {
   return parsed
 }
 
+function defaultContextOptions(): EvaluationContextOptions {
+  return {
+    profile: 'eval-minimal',
+    runMemory: false,
+    recordContextEvents: true,
+    reInjectActiveSkillsEachRound: true,
+    includeClaudeDefaultUserContext: false,
+    enableSlashCommands: false,
+    enableMcpClients: false,
+    networkPolicy: DEFAULT_EVALUATION_NETWORK_POLICY,
+    enableAgentTool: false,
+    disableAutoCompact: false,
+  }
+}
+
+function parseContextProfile(value: string, name: string): EvaluationContextProfile {
+  if (
+    value !== 'eval-minimal' &&
+    value !== 'eval-safe-claude-parity' &&
+    value !== 'full-claude-unsafe'
+  ) {
+    throw new Error(`${name} must be eval-minimal, eval-safe-claude-parity, or full-claude-unsafe, got: ${value}`)
+  }
+  return value
+}
+
+function parseNetworkPolicy(value: string, name: string): EvaluationNetworkPolicy {
+  if (value !== 'disabled' && value !== 'enabled') {
+    throw new Error(`${name} must be disabled or enabled, got: ${value}`)
+  }
+  return value
+}
+
+function parseJudgeFeedbackLevel(value: string, name: string): JudgeFeedbackLevel {
+  if (
+    value !== 'overall_only' &&
+    value !== 'case_only' &&
+    value !== 'metric_status' &&
+    value !== 'metric_value' &&
+    value !== 'metric_full'
+  ) {
+    throw new Error(
+      `${name} must be overall_only, case_only, metric_status, metric_value, or metric_full, got: ${value}`,
+    )
+  }
+  return value
+}
+
 export function parseEvaluationCliArgs(args: string[]): EvaluationCliArgs {
   let taskId = ''
   const taskIds: string[] = []
@@ -90,13 +170,28 @@ export function parseEvaluationCliArgs(args: string[]): EvaluationCliArgs {
   let concurrency = 3
   let workerTimeoutGraceSeconds: number | undefined
   let systemPromptPath: string | undefined
-  let priorContextPath: string | undefined
+  const userPromptPaths: string[] = []
   let timestamp: string | undefined
   let verbose = true
   let agentRuntime: AgentRuntime = 'source'
   let workerRun = false
   let temperature = 1
   let thinking: EvaluationThinkingMode = 'disabled'
+  let judgeFeedbackLevel: JudgeFeedbackLevel | undefined
+  const skillOptions: EvaluationSkillOptions = {
+    enabled: false,
+    skillsDir: 'skills',
+    mode: 'native',
+  }
+  const knownTaskMaterials: KnownTaskMaterialsOptions = {
+    enabled: false,
+    sourceTaskIds: [],
+  }
+  const contextOptions = defaultContextOptions()
+  let allowUnsafeContext = false
+  let skillsDirProvided = false
+  let skillNameProvided = false
+  let maxActiveSkillsProvided = false
 
   function addTaskIds(value: string): void {
     for (const id of value.split(',').map(item => item.trim()).filter(Boolean)) {
@@ -176,13 +271,111 @@ export function parseEvaluationCliArgs(args: string[]): EvaluationCliArgs {
       index++
       continue
     }
+    if (arg === '--judge-feedback-level') {
+      judgeFeedbackLevel = parseJudgeFeedbackLevel(readOption(args, index, arg), arg)
+      index++
+      continue
+    }
+    if (arg === '--context-profile') {
+      contextOptions.profile = parseContextProfile(readOption(args, index, arg), arg)
+      index++
+      continue
+    }
+    if (arg === '--enable-run-memory') {
+      contextOptions.runMemory = true
+      continue
+    }
+    if (arg === '--resume-run') {
+      contextOptions.resumeRun = readOption(args, index, arg)
+      contextOptions.runMemory = true
+      index++
+      continue
+    }
+    if (arg === '--disable-context-events') {
+      contextOptions.recordContextEvents = false
+      continue
+    }
+    if (arg === '--disable-auto-compact') {
+      contextOptions.disableAutoCompact = true
+      continue
+    }
+    if (arg === '--disable-skill-reinject') {
+      contextOptions.reInjectActiveSkillsEachRound = false
+      continue
+    }
+    if (arg === '--include-claude-default-user-context') {
+      contextOptions.includeClaudeDefaultUserContext = true
+      continue
+    }
+    if (arg === '--enable-slash-commands') {
+      contextOptions.enableSlashCommands = true
+      continue
+    }
+    if (arg === '--enable-mcp') {
+      contextOptions.enableMcpClients = true
+      continue
+    }
+    if (arg === '--network-policy') {
+      contextOptions.networkPolicy = parseNetworkPolicy(readOption(args, index, arg), arg)
+      index++
+      continue
+    }
+    if (arg === '--enable-agent-tool') {
+      contextOptions.enableAgentTool = true
+      continue
+    }
+    if (arg === '--disable-agent-tool') {
+      contextOptions.enableAgentTool = false
+      continue
+    }
+    if (arg === '--allow-unsafe-context') {
+      allowUnsafeContext = true
+      continue
+    }
+    if (arg === '--enable-skills') {
+      skillOptions.enabled = true
+      continue
+    }
+    if (arg === '--skills-dir') {
+      const dir = readOption(args, index, arg)
+      if (!skillsDirProvided) {
+        skillOptions.skillsDir = dir
+      } else {
+        skillOptions.additionalSkillsDirs = [...(skillOptions.additionalSkillsDirs ?? []), dir]
+      }
+      skillsDirProvided = true
+      index++
+      continue
+    }
+    if (arg === '--skill-name') {
+      skillNameProvided = true
+      skillOptions.allowedSkillNames = [...(skillOptions.allowedSkillNames ?? []), readOption(args, index, arg)]
+      index++
+      continue
+    }
+    if (arg === '--max-active-skills') {
+      maxActiveSkillsProvided = true
+      skillOptions.maxActiveSkills = parsePositiveInteger(readOption(args, index, arg), arg)
+      index++
+      continue
+    }
+    if (arg === '--known-task') {
+      knownTaskMaterials.enabled = true
+      knownTaskMaterials.sourceTaskIds.push(readOption(args, index, arg))
+      index++
+      continue
+    }
+    if (arg === '--known-task-deep-read') {
+      knownTaskMaterials.deepRead = true
+      continue
+    }
     if (arg === '--system-prompt') {
       systemPromptPath = readOption(args, index, arg)
       index++
       continue
     }
-    if (arg === '--prior-context') {
-      priorContextPath = readOption(args, index, arg)
+    if (arg === '--user-prompt') {
+      userPromptPaths.push(readOption(args, index, arg))
       index++
       continue
     }
@@ -209,6 +402,25 @@ export function parseEvaluationCliArgs(args: string[]): EvaluationCliArgs {
   if (!taskId) {
     throw new Error(`Missing required --task.\n\n${usage()}`)
   }
+  if (skillsDirProvided && !skillOptions.enabled) {
+    throw new Error('--skills-dir requires --enable-skills')
+  }
+  if (skillNameProvided && !skillOptions.enabled) {
+    throw new Error('--skill-name requires --enable-skills')
+  }
+  if (maxActiveSkillsProvided && !skillOptions.enabled) {
+    throw new Error('--max-active-skills requires --enable-skills')
+  }
+  if (knownTaskMaterials.deepRead && knownTaskMaterials.sourceTaskIds.length === 0) {
+    throw new Error('--known-task-deep-read requires at least one --known-task')
+  }
+  if (contextOptions.profile === 'full-claude-unsafe') {
+    if (!allowUnsafeContext) {
+      throw new Error('full-claude-unsafe requires --allow-unsafe-context')
+    }
+    contextOptions.includeClaudeDefaultUserContext = true
+  }
+  validateEvaluationNetworkPolicy(contextOptions)
 
   return {
     taskId,
@@ -221,13 +433,17 @@ export function parseEvaluationCliArgs(args: string[]): EvaluationCliArgs {
     concurrency,
     workerTimeoutGraceSeconds,
     systemPromptPath,
-    priorContextPath,
+    userPromptPaths,
     timestamp,
     verbose,
     agentRuntime,
     workerRun,
     temperature,
     thinking,
+    judgeFeedbackLevel,
+    skillOptions,
+    contextOptions,
+    knownTaskMaterials,
   }
 }
 
@@ -236,81 +452,31 @@ async function readSystemPrompt(path: string | undefined): Promise<string | unde
   return readFile(path, 'utf8')
 }
 
-/**
- * Read a prior-context JSON file written by a serial orchestrator and normalise
- * it into a `PriorSubtaskContext[]`. The file may either be a bare array of
- * records or an object with a `priorSubtasks` field (the latter lets the
- * orchestrator add metadata alongside the array).
- *
- * Returns `undefined` if no path was supplied. Throws with a clear message if
- * the file exists but cannot be parsed/validated, so the CLI fails fast rather
- * than silently dropping context.
- */
-async function readPriorContext(
-  path: string | undefined,
-): Promise<PriorSubtaskContext[] | undefined> {
-  if (!path) return undefined
-  const raw = await readFile(path, 'utf8')
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`--prior-context: invalid JSON in ${path}: ${message}`)
-  }
-  const candidate =
-    Array.isArray(parsed)
-      ? parsed
-      : parsed && typeof parsed === 'object' && Array.isArray((parsed as { priorSubtasks?: unknown }).priorSubtasks)
-        ? (parsed as { priorSubtasks: unknown[] }).priorSubtasks
-        : undefined
-  if (!candidate) {
-    throw new Error(
-      `--prior-context: ${path} must be an array of prior-subtask records or an object with a 'priorSubtasks' array.`,
-    )
-  }
-  const result: PriorSubtaskContext[] = []
-  for (let i = 0; i < candidate.length; i++) {
-    const item = candidate[i]
-    if (!item || typeof item !== 'object') {
-      throw new Error(`--prior-context: entry [${i}] in ${path} is not an object.`)
-    }
-    const rec = item as Record<string, unknown>
-    const taskId = rec.taskId ?? rec.task_id
-    if (typeof taskId !== 'string' || !taskId.trim()) {
-      throw new Error(`--prior-context: entry [${i}] in ${path} is missing 'taskId'.`)
-    }
-    const taskIdxRaw = rec.taskIdx ?? rec.task_idx
-    const taskIdx =
-      typeof taskIdxRaw === 'number' && Number.isFinite(taskIdxRaw) ? taskIdxRaw : undefined
-    const status = typeof rec.status === 'string' ? rec.status : undefined
-    const passed = typeof rec.passed === 'boolean' ? rec.passed : undefined
-    const description = typeof rec.description === 'string' ? rec.description : undefined
-    const generatedCodeRaw = rec.generatedCode ?? rec.generated_code
-    const generatedCode = typeof generatedCodeRaw === 'string' ? generatedCodeRaw : undefined
-    const judgeFeedbackRaw = rec.judgeFeedback ?? rec.judge_feedback
-    const judgeFeedback = typeof judgeFeedbackRaw === 'string' ? judgeFeedbackRaw : undefined
-    const notes = typeof rec.notes === 'string' ? rec.notes : undefined
-    result.push({
-      taskId,
-      taskIdx,
-      status,
-      passed,
-      description,
-      generatedCode,
-      judgeFeedback,
-      notes,
-    })
-  }
-  return result.length > 0 ? result : undefined
+async function readUserPrompt(paths: string[]): Promise<string | undefined> {
+  if (paths.length === 0) return undefined
+  const parts = await Promise.all(
+    paths.map(async path => {
+      const content = (await readFile(path, 'utf8')).trim()
+      return [`# User prompt file: ${path}`, content].join('\n')
+    }),
+  )
+  return parts.join('\n\n---\n\n')
 }
 
 export function exitCodeForLoopStatus(status: LoopStatus): number {
   return status === 'success' ? 0 : 1
 }
 
+export function configureEvaluationBashTimeoutEnv(timeoutSeconds: number): void {
+  const capMs = Math.max(1, Math.floor(timeoutSeconds * 1000))
+  const existing = Number(process.env.SOURCE_EVAL_MAX_BASH_TIMEOUT_MS)
+  if (Number.isFinite(existing) && existing > 0 && existing <= capMs) return
+  process.env.SOURCE_EVAL_MAX_BASH_TIMEOUT_MS = String(capMs)
+}
+
 async function main(): Promise<void> {
   const parsed = parseEvaluationCliArgs(process.argv.slice(2))
+  configureEvaluationBashTimeoutEnv(parsed.timeoutSeconds)
   if (parsed.taskIds.length > 1 && !parsed.workerRun) {
     const batch = await runEvaluationBatch({
       taskIds: parsed.taskIds,
@@ -323,7 +489,12 @@ async function main(): Promise<void> {
       workerTimeoutGraceSeconds: parsed.workerTimeoutGraceSeconds,
       temperature: parsed.temperature,
       thinking: parsed.thinking,
+      judgeFeedbackLevel: parsed.judgeFeedbackLevel,
+      skillOptions: parsed.skillOptions,
+      contextOptions: parsed.contextOptions,
+      knownTaskMaterials: parsed.knownTaskMaterials,
       systemPromptPath: parsed.systemPromptPath,
+      userPromptPaths: parsed.userPromptPaths,
       timestamp: parsed.timestamp,
       verbose: parsed.verbose,
     })
@@ -333,7 +504,7 @@ async function main(): Promise<void> {
   }
 
   const systemPrompt = await readSystemPrompt(parsed.systemPromptPath)
-  const priorSubtasks = await readPriorContext(parsed.priorContextPath)
+  const userPrompt = await readUserPrompt(parsed.userPromptPaths)
   const result = await runSourceTaskLoop({
     taskId: parsed.taskId,
     tasksDir: parsed.tasksDir,
@@ -343,13 +514,17 @@ async function main(): Promise<void> {
     timeoutSeconds: parsed.timeoutSeconds,
     timestamp: parsed.timestamp,
     systemPrompt,
+    userPrompt,
     verbose: parsed.verbose,
     llmOptions: {
       temperature: parsed.temperature,
       thinking: parsed.thinking,
     },
+    judgeFeedbackLevel: parsed.judgeFeedbackLevel,
+    skillOptions: parsed.skillOptions,
+    contextOptions: parsed.contextOptions,
+    knownTaskMaterials: parsed.knownTaskMaterials,
     judge: new DefaultJudgeRunner(),
-    priorSubtasks,
   })
 
   process.stdout.write(
@@ -370,16 +545,19 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
+  let exitCode = 0
   try {
     await main()
+    exitCode = typeof process.exitCode === 'number' ? process.exitCode : 0
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (message.startsWith('Usage:')) {
       process.stdout.write(`${message}\n`)
-      process.exitCode = 0
+      exitCode = 0
     } else {
       process.stderr.write(`${message}\n`)
-      process.exitCode = 1
+      exitCode = 1
     }
   }
+  process.exit(exitCode)
 }

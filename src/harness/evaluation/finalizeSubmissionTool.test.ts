@@ -199,6 +199,69 @@ describe('createFinalizeSubmissionTool', () => {
     expect(state.warnings?.map(warning => warning.code)).toContain('missing_round_plan')
   })
 
+  test('records a warning when active skills are enabled but skill_application is missing', async () => {
+    const taskRun = await fakeTaskRun()
+    await writePlanArtifacts(taskRun)
+    await writeNpz(join(taskRun.outputsDir, 'case_000.npz'))
+    const state = { readyForJudge: false as boolean, summary: '', files: [] as string[] }
+    const tool = createFinalizeSubmissionTool({
+      taskRun,
+      state,
+      runtime,
+      requireSkillApplication: true,
+      allowedSkillNames: ['runtime-budgeting'],
+    })
+
+    const result = await tool.call(
+      { summary: 'ready with missing skill application', files: ['outputs/case_000.npz'] },
+      {} as never,
+      async () => ({ behavior: 'allow' }),
+      {} as never,
+    )
+
+    expect(state.readyForJudge).toBe(true)
+    expect(state.warnings?.map(warning => warning.code)).toContain(
+      'missing_skill_application',
+    )
+    expect(
+      state.pendingEvents?.some(
+        event => event.type === 'run_warning' && event.code === 'missing_skill_application',
+      ),
+    ).toBe(true)
+    expect(result.data).toContain('workspace/skill_application.json is missing')
+  })
+
+  test('records a warning when skill_application is malformed', async () => {
+    const taskRun = await fakeTaskRun()
+    await writePlanArtifacts(taskRun)
+    await writeNpz(join(taskRun.outputsDir, 'case_000.npz'))
+    await writeFile(
+      join(taskRun.workspaceDir, 'skill_application.json'),
+      '{not-json',
+      'utf8',
+    )
+    const state = { readyForJudge: false as boolean, summary: '', files: [] as string[] }
+    const tool = createFinalizeSubmissionTool({
+      taskRun,
+      state,
+      runtime,
+      requireSkillApplication: true,
+      allowedSkillNames: ['runtime-budgeting'],
+    })
+
+    await tool.call(
+      { summary: 'ready with malformed skill application', files: ['outputs/case_000.npz'] },
+      {} as never,
+      async () => ({ behavior: 'allow' }),
+      {} as never,
+    )
+
+    expect(state.readyForJudge).toBe(true)
+    expect(state.warnings?.map(warning => warning.code)).toContain(
+      'invalid_skill_application',
+    )
+  })
+
   test('rejects invalid required round plan paths', async () => {
     const taskRun = await fakeTaskRun()
     await writeNpz(join(taskRun.outputsDir, 'case_000.npz'))

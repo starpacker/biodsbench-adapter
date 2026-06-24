@@ -60,10 +60,58 @@ export type RuntimeResolution =
     }
 
 export type EvaluationThinkingMode = 'disabled' | 'adaptive'
+export type EvaluationNetworkPolicy = 'disabled' | 'enabled'
+
+export type JudgeFeedbackLevel =
+  | 'overall_only'
+  | 'case_only'
+  | 'metric_status'
+  | 'metric_value'
+  | 'metric_full'
 
 export type EvaluationLlmOptions = {
   temperature: number
   thinking: EvaluationThinkingMode
+}
+
+export type EvaluationContextProfile =
+  | 'eval-minimal'
+  | 'eval-safe-claude-parity'
+  | 'full-claude-unsafe'
+
+export type EvaluationContextOptions = {
+  profile: EvaluationContextProfile
+  runMemory: boolean
+  resumeRun?: string
+  recordContextEvents: boolean
+  reInjectActiveSkillsEachRound: boolean
+  includeClaudeDefaultUserContext: boolean
+  enableSlashCommands: boolean
+  enableMcpClients: boolean
+  networkPolicy: EvaluationNetworkPolicy
+  enableAgentTool: boolean
+  disableAutoCompact?: boolean
+}
+
+export type EvaluationSkillOptions = {
+  enabled: boolean
+  skillsDir: string
+  additionalSkillsDirs?: string[]
+  allowedSkillNames?: string[]
+  mode: 'native'
+  maxActiveSkills?: number
+}
+
+export type KnownTaskMaterialsOptions = {
+  enabled: boolean
+  sourceTaskIds: string[]
+  deepRead?: boolean
+}
+
+export type KnownTaskMaterialsAudit = {
+  enabled: boolean
+  copied: Array<{ sourceTaskId: string; files: string[] }>
+  skipped: Array<{ sourceTaskId: string; file: string; reason: string }>
 }
 
 export type EvaluationRunMetadata = {
@@ -116,7 +164,10 @@ export type SourceAgentStartInput = {
   userTask: string
   runtime: RuntimeInfo
   systemPrompt?: string
+  userPrompt?: string
   llmOptions?: EvaluationLlmOptions
+  skillOptions?: EvaluationSkillOptions
+  contextOptions?: EvaluationContextOptions
 }
 
 export type SourceAgentTurnInput = {
@@ -133,6 +184,7 @@ export type JudgeRunInput = {
   runtime: RuntimeInfo
   round: number
   timeoutSeconds: number
+  feedbackLevel?: JudgeFeedbackLevel
 }
 
 export type JudgeRunner = {
@@ -143,6 +195,12 @@ export type SourceAgentEvent =
   | {
       type: 'assistant_text'
       text: string
+      raw?: unknown
+    }
+  | {
+      type: 'assistant_thinking'
+      text: string
+      signature?: string
       raw?: unknown
     }
   | {
@@ -197,6 +255,14 @@ export type SourceAgentEvent =
       raw?: unknown
     }
   | {
+      type: 'context_event'
+      subtype: string
+      message?: string
+      usage?: unknown
+      metadata?: unknown
+      raw?: unknown
+    }
+  | {
       type: 'finalize'
       summary: string
       files: string[]
@@ -215,31 +281,6 @@ export type SourceSessionFactory = (
   input: SourceSessionFactoryInput,
 ) => Promise<SourceAgentSession>
 
-/**
- * Information about one already-completed sub-task in a serial evaluation
- * run. The orchestrator (e.g. `run_imaging101_*_serial.py`) feeds these
- * records into the next sub-task's initial prompt so the model can build
- * on shared analysis instead of re-deriving everything from scratch.
- */
-export type PriorSubtaskContext = {
-  /** Sub-task identifier (e.g. "25303977_3"). */
-  taskId: string
-  /** Sequence index within the serial run. */
-  taskIdx?: number
-  /** Final loop status of that sub-task ("success" | "failed" | "timeout"). */
-  status?: string
-  /** Whether the sub-task ultimately passed judge. */
-  passed?: boolean
-  /** Free-form task statement (typically the README.md of the sub-task). */
-  description?: string
-  /** Final solver code that produced the accepted submission (truncated by orchestrator if huge). */
-  generatedCode?: string
-  /** Last judge feedback for this sub-task, if any (helps the model avoid repeating mistakes). */
-  judgeFeedback?: string
-  /** Optional short notes the orchestrator wants to surface (e.g. derived data shapes). */
-  notes?: string
-}
-
 export type RunSourceTaskLoopInput = {
   taskId: string
   tasksDir?: string
@@ -249,13 +290,16 @@ export type RunSourceTaskLoopInput = {
   timeoutSeconds: number
   timestamp?: string
   systemPrompt?: string
+  userPrompt?: string
   verbose?: boolean
   llmOptions?: EvaluationLlmOptions
+  skillOptions?: EvaluationSkillOptions
+  contextOptions?: EvaluationContextOptions
+  knownTaskMaterials?: KnownTaskMaterialsOptions
+  judgeFeedbackLevel?: JudgeFeedbackLevel
   sessionFactory?: SourceSessionFactory
   sessionDisposeGraceMs?: number
   judge: JudgeRunner
-  /** Optional prior sub-task context for true-serial evaluation. */
-  priorSubtasks?: PriorSubtaskContext[]
 }
 
 export type RunSourceTaskLoopResult = {

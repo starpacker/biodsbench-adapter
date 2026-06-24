@@ -68,6 +68,28 @@ describe('SourceTrajectoryWriter', () => {
     expect(clean).toContain('"code":"public_dir_mutation"')
   })
 
+  test('writes context events to clean and raw trajectories', async () => {
+    const taskRun = await fakeTaskRun()
+    await mkdir(taskRun.logsDir, { recursive: true })
+    const writer = new SourceTrajectoryWriter(taskRun)
+    await writer.start({ startedAt: '2026-05-14T00:00:00.000Z' })
+
+    await writer.agentEvent(2, {
+      type: 'context_event',
+      subtype: 'compact_boundary',
+      message: 'summary preserved',
+      usage: { input_tokens: 1000 },
+      metadata: { nested: 'value' },
+    })
+
+    const raw = await readFile(writer.rawPath, 'utf8')
+    expect(raw).toContain('"type":"context_event"')
+    const clean = await readFile(writer.cleanPath, 'utf8')
+    expect(clean).toContain('"kind":"context_event"')
+    expect(clean).toContain('"subtype":"compact_boundary"')
+    expect(clean).toContain('"message":"summary preserved"')
+  })
+
   test('writes structured validation and run warning events to clean trajectory', async () => {
     const taskRun = await fakeTaskRun()
     await mkdir(taskRun.logsDir, { recursive: true })

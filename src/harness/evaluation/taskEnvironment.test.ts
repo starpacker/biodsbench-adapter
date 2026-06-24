@@ -116,6 +116,91 @@ describe('createTaskRun', () => {
     }
   })
 
+  test('copies known task README and std_code into public known_tasks', async () => {
+    const temp = mkdtempSync(join(tmpdir(), 'task-env-known-materials-'))
+    try {
+      const tasksDir = join(temp, 'tasks')
+      const runsDir = join(temp, 'runs')
+      await makeTaskPrototype(tasksDir, 'target')
+      await makeTaskPrototype(tasksDir, 'source-a')
+      await mkdir(join(tasksDir, 'source-a', 'std_code', 'src'), { recursive: true })
+      writeFileSync(
+        join(tasksDir, 'source-a', 'std_code', 'src', 'solvers.py'),
+        'def solve(): pass',
+      )
+
+      const run = await createTaskRun({
+        taskId: 'target',
+        tasksDir,
+        runsDir,
+        timestamp: '20260511_111213',
+        knownTaskMaterials: {
+          enabled: true,
+          sourceTaskIds: ['source-a'],
+        },
+      })
+
+      expect(existsSync(join(run.publicDir, 'known_tasks', 'source-a', 'README.md'))).toBe(true)
+      expect(existsSync(join(run.publicDir, 'known_tasks', 'source-a', 'std_code', 'main.py'))).toBe(true)
+      expect(existsSync(join(run.publicDir, 'known_tasks', 'source-a', 'std_code', 'src', 'solvers.py'))).toBe(true)
+      expect(existsSync(join(run.publicDir, 'known_tasks', 'source-a', 'output_schema.json'))).toBe(false)
+      expect(existsSync(join(run.publicDir, 'known_tasks', 'source-a', 'evaluation'))).toBe(false)
+      expect(existsSync(join(run.publicDir, 'known_tasks', 'source-a', 'visible_data'))).toBe(false)
+
+      const manifest = JSON.parse(
+        readFileSync(join(run.runDir, 'run_manifest.json'), 'utf8'),
+      )
+      expect(manifest.known_task_materials).toEqual({
+        enabled: true,
+        copied: [
+          {
+            sourceTaskId: 'source-a',
+            files: ['README.md', 'std_code/main.py', 'std_code/src/solvers.py'],
+          },
+        ],
+        skipped: [],
+      })
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects reusing an existing run directory to avoid stale materials', async () => {
+    const temp = mkdtempSync(join(tmpdir(), 'task-env-reuse-'))
+    try {
+      const tasksDir = join(temp, 'tasks')
+      const runsDir = join(temp, 'runs')
+      await makeTaskPrototype(tasksDir, 'target')
+      await makeTaskPrototype(tasksDir, 'source-a')
+
+      await createTaskRun({
+        taskId: 'target',
+        tasksDir,
+        runsDir,
+        timestamp: '20260511_222324',
+        knownTaskMaterials: {
+          enabled: true,
+          sourceTaskIds: ['source-a'],
+        },
+      })
+
+      await expect(
+        createTaskRun({
+          taskId: 'target',
+          tasksDir,
+          runsDir,
+          timestamp: '20260511_222324',
+          knownTaskMaterials: {
+            enabled: false,
+            sourceTaskIds: [],
+          },
+        }),
+      ).rejects.toThrow('Run directory already exists')
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
   test('links host runtime venv instead of copying venv internals', async () => {
     const temp = mkdtempSync(join(tmpdir(), 'task-env-runtime-link-'))
     try {
